@@ -1,0 +1,1 @@
+idf_component_register(SRCS "main.c" "motor.c" "encoder.c" "grayscale.c" "imu.c" "pid.c" "speed_control.c" "line_control.c" "ringbuf.c" "mapper.c" "wifi.c" "oled.c" INCLUDE_DIRS "." PRIV_REQUIRES driver esp_adc)
