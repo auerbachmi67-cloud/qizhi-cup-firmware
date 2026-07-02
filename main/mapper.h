@@ -1,13 +1,15 @@
 #pragma once
 #include "ringbuf.h"
 #include <stdint.h>
+#include <stdbool.h>
 
-#define MAP_MAX_SAMPLES 1024
+#define MAP_MAX_SAMPLES 2048
+#define MAP_SPACING_MM   5     // spatial sampling interval
 
 typedef struct {
     float distance_m;
+    float gyro_z;           // recorded gyro rate (°/s) — replaces κ
     float line_pos;
-    float curvature;
     float speed_mps;
 } map_sample_t;
 
@@ -22,5 +24,5 @@ void mapper_reset(void);
 int mapper_get_lap(void);
 float mapper_get_total_distance(void);
 
-// Load a speed profile from flash/PC for replay on lap 2+
-void mapper_load_profile(const float *speed_table, int count);
+// Load full target profile: (gyro_ff, target_speed) pairs, interleaved
+void mapper_load_profile(const float *data, int count);

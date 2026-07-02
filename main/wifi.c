@@ -16,7 +16,7 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
         esp_wifi_connect();
     else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
-        ESP_LOGI(TAG, "WiFi connected, ready to send on port %d", TELEMETRY_UDP_PORT);
+        ESP_LOGI(TAG, "WiFi connected, UDP target %s:%d", WIFI_UDP_TARGET_IP, TELEMETRY_UDP_PORT);
 }
 
 void wifi_init(void) {
@@ -43,11 +43,13 @@ void wifi_init(void) {
 }
 
 void wifi_send_telemetry(float line_pos, float left_speed, float right_speed,
-                         float target_speed, float gyro_z, float left_thr, float right_thr) {
+                         float target_speed, float gyro_z,
+                         float ff_omega, bool running) {
     if (sock < 0) return;
-    char buf[128];
+    char buf[160];
     int len = snprintf(buf, sizeof(buf),
-        "LP:%.2f LS:%.2f RS:%.2f TS:%.2f GZ:%.2f LT:%.3f RT:%.3f\n",
-        line_pos, left_speed, right_speed, target_speed, gyro_z, left_thr, right_thr);
+        "LP:%.2f LS:%.2f RS:%.2f TS:%.2f GZ:%.2f FF:%.2f LT:%.3f RT:%.3f RUN:%d\n",
+        line_pos, left_speed, right_speed, target_speed, gyro_z,
+        ff_omega, 0.0f, 0.0f, running ? 1 : 0);
     sendto(sock, buf, len, 0, (struct sockaddr*)&dest, sizeof(dest));
 }

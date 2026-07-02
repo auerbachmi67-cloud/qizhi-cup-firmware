@@ -3,9 +3,7 @@
 #include "esp_log.h"
 
 static const char *TAG = "IMU";
-#define I2C_PORT 0
-#define SDA_IO  15
-#define SCL_IO  16
+#define I2C_PORT I2C_NUM_0
 #define IMU_ADDR 0x68
 static float gyro_z_off = 0;
 #define GYRO_SENSITIVITY 131.0f  // ±250°/s default MPU6050, LSB/(°/s)
@@ -42,18 +40,9 @@ static int16_t imu_read_int16(uint8_t reg) {
 }
 
 void imu_init(void) {
-    i2c_config_t cfg = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = SDA_IO,
-        .scl_io_num = SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
-    };
-    i2c_param_config(I2C_PORT, &cfg);
-    i2c_driver_install(I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    // I2C 由 main.c 的 i2c_master_init() 统一初始化，此处只配置 MPU6050
     imu_write_reg(0x6B, 0x00);
-    ESP_LOGI(TAG, "MPU6050 init OK (SDA=15, SCL=16)");
+    ESP_LOGI(TAG, "MPU6050 init OK (I2C_NUM_0, addr=0x%02X)", IMU_ADDR);
 }
 
 void imu_calibrate(void) {

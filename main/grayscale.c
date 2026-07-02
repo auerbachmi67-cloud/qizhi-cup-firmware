@@ -1,6 +1,8 @@
 #include "grayscale.h"
 #include "driver/adc.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "GS";
@@ -19,7 +21,7 @@ static int lost_count = 0;
 void grayscale_init(void) {
     adc1_config_width(ADC_WIDTH_BIT_12);
     for (int i = 0; i < 8; i++) {
-        adc1_config_channel_atten(CH[i], ADC_ATTEN_DB_11);
+        adc1_config_channel_atten(CH[i], ADC_ATTEN_DB_12);
         calib_min[i] = 4095; calib_max[i] = 0;
     }
     ESP_LOGI(TAG, "8ch grayscale ADC1 init OK");
