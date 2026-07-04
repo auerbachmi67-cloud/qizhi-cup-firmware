@@ -1,7 +1,7 @@
 #include "line_control.h"
 #include "config.h"
 
-static pid_t line_pid;
+static pid_ctrl_t line_pid;
 static float last_line = 0.0f;
 
 void line_control_init(void) {

@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main.c" "motor.c" "grayscale.c" "imu.c" "pid.c" "speed_control.c" "line_control.c" "ringbuf.c" "mapper.c" "oled.c" "font.c" INCLUDE_DIRS "." PRIV_REQUIRES driver esp_adc nvs_flash)
+idf_component_register(SRCS "main.c" "motor.c" "encoder.c" "grayscale.c" "imu.c" "pid.c" "speed_control.c" "line_control.c" "ringbuf.c" "mapper.c" "wifi.c" "oled.c" "font.c" INCLUDE_DIRS "." PRIV_REQUIRES driver esp_adc esp_wifi nvs_flash esp_netif lwip esp_timer)

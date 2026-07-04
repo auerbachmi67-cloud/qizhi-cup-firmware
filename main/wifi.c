@@ -2,25 +2,28 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "config.h"
 
 static const char *TAG = "WIFI";
 static int sock = -1;
 static struct sockaddr_in dest;
+bool wifi_ready = false;
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
         esp_wifi_connect();
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
+    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_ready = false;
         esp_wifi_connect();
-    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
-        ESP_LOGI(TAG, "WiFi connected, UDP target %s:%d", WIFI_UDP_TARGET_IP, TELEMETRY_UDP_PORT);
+    }
+    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "WiFi connected!");
+        wifi_ready = true; // 只置标志位，不在回调里建 Socket
+    }
 }
 
 void wifi_init(void) {
-    nvs_flash_init();
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
@@ -35,21 +38,31 @@ void wifi_init(void) {
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);
     esp_wifi_start();
 
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(TELEMETRY_UDP_PORT);
-    dest.sin_addr.s_addr = inet_addr(WIFI_UDP_TARGET_IP);
-    ESP_LOGI(TAG, "WiFi STA init, UDP target %s:%d", WIFI_UDP_TARGET_IP, TELEMETRY_UDP_PORT);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(52);
 }
 
 void wifi_send_telemetry(float line_pos, float left_speed, float right_speed,
                          float target_speed, float gyro_z,
-                         float ff_omega, bool running) {
-    if (sock < 0) return;
+                         float ff_omega, float lt, float rt, bool running) {
+    if (!wifi_ready) return;
+
+    // 懒加载 Socket — 不在回调里建
+    if (sock < 0) {
+        sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) return;
+        int broadcast = 1;
+        setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(TELEMETRY_UDP_PORT);
+        dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+        ESP_LOGI(TAG, "Telemetry UDP ready");
+    }
+
     char buf[160];
     int len = snprintf(buf, sizeof(buf),
         "LP:%.2f LS:%.2f RS:%.2f TS:%.2f GZ:%.2f FF:%.2f LT:%.3f RT:%.3f RUN:%d\n",
         line_pos, left_speed, right_speed, target_speed, gyro_z,
-        ff_omega, 0.0f, 0.0f, running ? 1 : 0);
+        ff_omega, lt, rt, running ? 1 : 0);
     sendto(sock, buf, len, 0, (struct sockaddr*)&dest, sizeof(dest));
 }

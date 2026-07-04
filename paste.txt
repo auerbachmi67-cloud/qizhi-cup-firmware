@@ -1,0 +1,2257 @@
+=== sdkconfig.defaults ===
+# ESP-IDF sdkconfig.defaults — 启智杯智能小车
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# CPU 频率
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# FreeRTOS
+CONFIG_FREERTOS_UNICORE=n
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_OPTIMIZED_SCHEDULER=y
+
+# I2C / PCNT
+CONFIG_I2C_ISR_IRAM_SAFE=y
+CONFIG_PCNT_ISR_IRAM_SAFE=y
+
+# WiFi
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+
+# 日志
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+
+# PSRAM — 暂时关闭，验证 QIO Flash 是否被 Octal PSRAM 抢 SPI2 总线
+CONFIG_SPIRAM=n
+
+=== main/CMakeLists.txt ===
+idf_component_register(SRCS "main.c" "motor.c" "grayscale.c" "imu.c" "pid.c" "speed_control.c" "line_control.c" "ringbuf.c" "mapper.c" "oled.c" "font.c" INCLUDE_DIRS "." PRIV_REQUIRES driver esp_adc nvs_flash)
+
+=== main/config.h ===
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#define CONTROL_LOOP_HZ   1000
+#define PID_OUTPUT_LIMIT   100.0f
+
+#define SPEED_PID_KP  1.5f
+#define SPEED_PID_KI  0.1f
+#define SPEED_PID_KD  0.05f
+
+#define LINE_PID_KP   2.0f
+#define LINE_PID_KI   0.2f
+#define LINE_PID_KD   0.1f
+#define LINE_PID_FF_RATIO  0.3f   // reduce line PID to 30% when FF active
+
+// Physical conversion: ω (°/s) → differential throttle
+// Δv = ω_rad × track_width = ω_dps × π/180 × 0.160
+// diff = Δv / (2 × V_ss_max) = ω_dps × 0.00279 / 6.3
+#define GYRO_TO_DIFF   0.000443f   // (°/s) → throttle diff, theory
+#define FF_OMEGA_GAIN  0.0005f     // tune experimentally
+
+#define WHEEL_DIAMETER_MM   22.0f
+#define PULSES_PER_REV      40
+#define ENCODER_GEAR_RATIO  10.0f
+#define TRACK_WIDTH_MM      160.0f
+
+#define MAX_SPEED_MPS       3.5f
+#define MAP_SAMPLE_RATE_HZ  100
+#define RINGBUF_SIZE        512
+
+// ── State machine & safety ───────────────────────────────────────────────
+#define START_BUTTON_GPIO    9    // GPIO 9, internal pull-up, button to GND
+#define BUTTON_DEBOUNCE_MS  50
+#define WATCHDOG_TIMEOUT_MS 500  // PC heartbeat → auto-stop
+#define BATTERY_NOMINAL_V    11.1f
+
+// ── Communication ─────────────────────────────────────────────────────────
+#define TELEMETRY_UDP_PORT    3333
+#define WIFI_UDP_TARGET_IP    "192.168.4.2"
+#define WIFI_SSID             "mcy4"
+#define WIFI_PASS             "mcy12306"
+
+#endif
+
+=== main/encoder.c ===
+#include "encoder.h"
+#include "esp_log.h"
+
+static const char *TAG = "ENC";
+
+void encoder_init(void) {
+    ESP_LOGW(TAG, "encoder skipped (gpio pin conflict with other peripherals)");
+}
+
+int32_t encoder_get_count(int ch) {
+    (void)ch;
+    return 0;
+}
+
+float encoder_get_speed(int ch) {
+    (void)ch;
+    return 0.0f;
+}
+
+void encoder_reset(int ch) {
+    (void)ch;
+}
+
+
+int32_t encoder_get_count(int ch) {
+    (void)ch;
+    return 0;
+}
+
+float encoder_get_speed(int ch) {
+    (void)ch;
+    return 0.0f;
+}
+
+void encoder_reset(int ch) {
+    (void)ch;
+}
+
+=== main/encoder.h ===
+#pragma once
+#include <stdint.h>
+void encoder_init(void);
+float encoder_get_speed(int channel);
+int32_t encoder_get_count(int channel);
+void encoder_reset(int channel);
+
+=== main/grayscale.c ===
+#include "grayscale.h"
+#include "driver/adc.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <string.h>
+
+static const char *TAG = "GS";
+
+static const adc1_channel_t CH[8] = {
+    ADC1_CHANNEL_0, ADC1_CHANNEL_1, ADC1_CHANNEL_2, ADC1_CHANNEL_3,
+    ADC1_CHANNEL_4, ADC1_CHANNEL_5, ADC1_CHANNEL_6, ADC1_CHANNEL_7,
+};
+
+static uint16_t raw[8];
+static uint16_t calib_min[8], calib_max[8];
+static bool calibrated = false;
+static float last_position = 0.0f;
+static int lost_count = 0;
+
+void grayscale_init(void) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    for (int i = 0; i < 8; i++) {
+        adc1_config_channel_atten(CH[i], ADC_ATTEN_DB_12);
+        calib_min[i] = 4095; calib_max[i] = 0;
+    }
+    ESP_LOGI(TAG, "8ch grayscale ADC1 init OK");
+}
+
+void grayscale_read(uint16_t *out) {
+    for (int i = 0; i < 8; i++)
+        out[i] = adc1_get_raw(CH[i]);
+}
+
+void grayscale_calibrate(void) {
+    ESP_LOGI(TAG, "Calibrating... move sensor over line & background");
+    for (int n = 0; n < 200; n++) {
+        grayscale_read(raw);
+        for (int i = 0; i < 8; i++) {
+            if (raw[i] < calib_min[i]) calib_min[i] = raw[i];
+            if (raw[i] > calib_max[i]) calib_max[i] = raw[i];
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    calibrated = true;
+    ESP_LOGI(TAG, "Calibration done");
+    for (int i = 0; i < 8; i++)
+        ESP_LOGI(TAG, "  ch%d: %d-%d", i, calib_min[i], calib_max[i]);
+}
+
+float grayscale_get_line_position(void) {
+    grayscale_read(raw);
+
+    // Normalize 0..1 using calibration
+    float norm[8];
+    int active = 0;
+    for (int i = 0; i < 8; i++) {
+        if (calibrated) {
+            int range = (int)calib_max[i] - (int)calib_min[i];
+            if (range < 10) range = 10;
+            norm[i] = 1.0f - ((float)(raw[i] - calib_min[i]) / (float)range);
+            if (norm[i] < 0.0f) norm[i] = 0.0f;
+            if (norm[i] > 1.0f) norm[i] = 1.0f;
+        } else {
+            norm[i] = 1.0f - ((float)raw[i] / 4095.0f);
+        }
+        // Line = dark = low ADC value → high norm value
+        if (norm[i] > 0.5f) active++;
+    }
+
+    // Lost line recovery: if < 2 sensors see line, use last position
+    if (active < 2) {
+        lost_count++;
+        if (lost_count > 20) {
+            // Extended loss — search in last known direction
+            return (last_position > 0) ? 5.0f : -5.0f;
+        }
+        return last_position;
+    }
+    lost_count = 0;
+
+    // Weighted center of gravity, index 0-7 mapped to -3.5..+3.5
+    float sum = 0.0f, weighted = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        sum += norm[i];
+        weighted += norm[i] * (float)(i);
+    }
+    if (sum < 0.01f) return last_position;
+
+    last_position = weighted / sum - 3.5f;
+    return last_position;
+}
+
+void grayscale_set_threshold(float t) { (void)t; }
+bool grayscale_is_calibrated(void) { return calibrated; }
+
+=== main/grayscale.h ===
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+void grayscale_init(void);
+void grayscale_read(uint16_t *values);
+void grayscale_calibrate(void);
+float grayscale_get_line_position(void);
+void grayscale_set_threshold(float t);
+bool grayscale_is_calibrated(void);
+
+=== main/imu.c ===
+#include "imu.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+
+static const char *TAG = "IMU";
+#define I2C_PORT I2C_NUM_0
+#define IMU_ADDR 0x68
+static float gyro_z_off = 0;
+#define GYRO_SENSITIVITY 131.0f  // ±250°/s default MPU6050, LSB/(°/s)
+
+static void imu_write_reg(uint8_t reg, uint8_t val) {
+    i2c_cmd_handle_t c = i2c_cmd_link_create();
+    i2c_master_start(c);
+    i2c_master_write_byte(c, (IMU_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(c, reg, true);
+    i2c_master_write_byte(c, val, true);
+    i2c_master_stop(c);
+    i2c_master_cmd_begin(I2C_PORT, c, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(c);
+}
+
+static int16_t imu_read_int16(uint8_t reg) {
+    uint8_t b[2];
+    i2c_cmd_handle_t c = i2c_cmd_link_create();
+    i2c_master_start(c);
+    i2c_master_write_byte(c, (IMU_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(c, reg, true);
+    i2c_master_stop(c);
+    i2c_master_cmd_begin(I2C_PORT, c, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(c);
+    c = i2c_cmd_link_create();
+    i2c_master_start(c);
+    i2c_master_write_byte(c, (IMU_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(c, &b[0], I2C_MASTER_ACK);
+    i2c_master_read_byte(c, &b[1], I2C_MASTER_NACK);
+    i2c_master_stop(c);
+    i2c_master_cmd_begin(I2C_PORT, c, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(c);
+    return (int16_t)((b[0] << 8) | b[1]);
+}
+
+void imu_init(void) {
+    // I2C 由 main.c 的 i2c_master_init() 统一初始化，此处只配置 MPU6050
+    imu_write_reg(0x6B, 0x00);
+    ESP_LOGI(TAG, "MPU6050 init OK (I2C_NUM_0, addr=0x%02X)", IMU_ADDR);
+}
+
+void imu_calibrate(void) {
+    gyro_z_off = 0;
+    for (int i = 0; i < 100; i++) {
+        gyro_z_off += imu_read_int16(0x47) / GYRO_SENSITIVITY;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    gyro_z_off /= 100.0f;
+    ESP_LOGI(TAG, "Gyro Z bias: %.2f deg/s", gyro_z_off);
+}
+
+float imu_get_gyro_z(void) { return imu_read_int16(0x47) / GYRO_SENSITIVITY - gyro_z_off; }
+float imu_get_accel_z(void) { return imu_read_int16(0x3F) / 16384.0f; }
+
+=== main/imu.h ===
+#pragma once
+#include <stdint.h>
+void imu_init(void);
+void imu_calibrate(void);
+float imu_get_gyro_z(void);
+float imu_get_accel_z(void);
+
+=== main/line_control.c ===
+#include "line_control.h"
+#include "config.h"
+
+static pid_t line_pid;
+static float last_line = 0.0f;
+
+void line_control_init(void) {
+    pid_init(&line_pid, LINE_PID_KP, LINE_PID_KI, LINE_PID_KD, PID_OUTPUT_LIMIT);
+}
+
+// Legacy — used on mapping lap (no FF)
+float line_control_update(float line_position) {
+    last_line = line_position;
+    return pid_update(&line_pid, 0.0f, -line_position);
+}
+
+// FF mode: ω_ff (°/s) → throttle diff via experimental gain
+// Theory: diff = ω_dps × 0.000443, but we use tunable FF_OMEGA_GAIN
+float line_control_update_ff(float line_position, float gyro_ff, float speed_mps) {
+    last_line = line_position;
+    (void)speed_mps;  // reserved for speed-dependent gain scaling
+
+    // PID feedback — reduced gain when FF is active
+    float fb = pid_update(&line_pid, 0.0f, -line_position) * LINE_PID_FF_RATIO;
+
+    // Feedforward: gyro (°/s) → throttle differential
+    // sign convention: positive gyro = CCW (left turn) → right wheel faster
+    float ff = gyro_ff * FF_OMEGA_GAIN;
+
+    return fb + ff;
+}
+
+// Lost-line emergency turn — steer hard in last known direction
+float line_control_search_turn(float last_known_side) {
+    // Reset PID state so integral doesn't carry over from before loss
+    pid_reset(&line_pid);
+    return (last_known_side > 0) ? 0.5f : -0.5f;  // half throttle diff to search
+}
+
+=== main/line_control.h ===
+#pragma once
+#include "pid.h"
+
+void line_control_init(void);
+float line_control_update(float line_position);
+
+// Inject gyro feedforward (°/s) — added to PID output to form total diff
+float line_control_update_ff(float line_position, float gyro_ff, float speed_mps);
+
+// Bang-bang search: steer full while line is lost
+float line_control_search_turn(float last_known_side);
+
+=== main/mapper.c ===
+#include "mapper.h"
+#include "grayscale.h"
+#include "imu.h"
+#include "config.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include <string.h>
+#include <math.h>
+extern float encoder_get_speed(int ch);
+
+static const char *TAG = "MAP";
+static map_sample_t map[MAP_MAX_SAMPLES];
+static int32_t map_count = 0;
+static float total_dist = 0.0f;
+static float lap_reference_length = 0.0f;
+static int lap = 0;
+
+// Profile storage: interleaved (gyro_ff, target_speed) pairs
+static float *profile_data = NULL;
+static int profile_pairs = 0;
+
+static float last_sample_dist = 0.0f;
+static control_cmd_t next_cmd = {false, 0, MAX_SPEED_MPS, 0};
+
+void mapper_init(void) {
+    memset(map, 0, sizeof(map)); map_count = 0; total_dist = 0.0f;
+    lap_reference_length = 0.0f; lap = 0; last_sample_dist = 0.0f;
+    next_cmd.active = false; profile_data = NULL; profile_pairs = 0;
+    ESP_LOGI(TAG, "Mapper reset (gyro-FF mode)");
+}
+
+void mapper_load_profile(const float *data, int count) {
+    // data: interleaved (gyro_ff, target_speed) pairs, so count is total floats
+    // count must be even (2 floats per pair)
+    if (count < 4 || (count & 1)) {
+        ESP_LOGE(TAG, "Invalid profile: %d floats", count);
+        return;
+    }
+    profile_data = (float*)data;
+    profile_pairs = count / 2;
+    lap = 1;  // skip mapping lap, replay mode
+    ESP_LOGI(TAG, "Profile loaded: %d pairs (gyro_ff + speed)", profile_pairs);
+}
+
+// Spatial sampling: record at ~5mm intervals using encoder odometry
+void mapper_sample(void) {
+    if (map_count >= MAP_MAX_SAMPLES) return;
+
+    float l_spd = encoder_get_speed(0);
+    float r_spd = encoder_get_speed(1);
+    float avg_spd = (l_spd + r_spd) * 0.5f;
+    total_dist += avg_spd / (float)MAP_SAMPLE_RATE_HZ;
+
+    // Spatial decimation: only record every MAP_SPACING_MM
+    if (total_dist - last_sample_dist < (MAP_SPACING_MM / 1000.0f)) return;
+    last_sample_dist = total_dist;
+
+    float line_pos = grayscale_get_line_position();
+    float gyro_z = imu_get_gyro_z();  // direct measurement, no κ computation
+
+    map[map_count].distance_m = total_dist;
+    map[map_count].gyro_z     = gyro_z;
+    map[map_count].line_pos   = line_pos;
+    map[map_count].speed_mps  = avg_spd;
+    map_count++;
+}
+
+// Predict: look up gyro_ff and target_speed from profile or map
+void mapper_predict(void) {
+    if (map_count < 2) { next_cmd.active = false; return; }
+
+    if (profile_data && profile_pairs > 0) {
+        // ── Profile replay mode (lap 2+) ──────────────────────────────────
+        if (lap_reference_length < 0.001f) { next_cmd.active = false; return; }
+
+        // Normalize current position to [0, 1] over reference lap length
+        float ratio = total_dist / lap_reference_length;
+        // Allow exceeding reference length (safety margin)
+        if (ratio > 1.05f) { next_cmd.active = false; return; }
+        if (ratio < 0.0f)  ratio = 0.0f;
+
+        float fidx = ratio * (float)(profile_pairs - 1);
+        int idx = (int)fidx;
+        if (idx >= profile_pairs - 1) idx = profile_pairs - 2;
+        if (idx < 0) idx = 0;
+
+        // Linear interpolate between adjacent profile entries
+        float frac = fidx - (float)idx;
+        float gyro_ff_a = profile_data[idx * 2];
+        float speed_a   = profile_data[idx * 2 + 1];
+        float gyro_ff_b = profile_data[(idx + 1) * 2];
+        float speed_b   = profile_data[(idx + 1) * 2 + 1];
+
+        next_cmd.active           = true;
+        next_cmd.feedforward_omega = gyro_ff_a + (gyro_ff_b - gyro_ff_a) * frac;
+        next_cmd.target_speed      = speed_a + (speed_b - speed_a) * frac;
+        next_cmd.timestamp_ms      = (uint32_t)(esp_timer_get_time() / 1000);
+        return;
+    }
+
+    // ── Mapping lap mode (lap 0): simple curvature-based speed limit ──────
+    // No feedforward during mapping — just limit speed based on curvature
+    float lookahead = total_dist + 0.1f;  // 10 cm look-ahead
+    int idx = 0; float best_d = 1e9f;
+    for (int i = 0; i < map_count; i++) {
+        float d = fabsf(map[i].distance_m - lookahead);
+        if (d < best_d) { best_d = d; idx = i; }
+    }
+    // Estimate curvature from recorded gyro
+    float gyro_abs = fabsf(map[idx].gyro_z);
+    float omega_rad = gyro_abs * 0.0174533f;  // °/s → rad/s
+    float v_est = (fabsf(map[idx].speed_mps) > 0.05f) ? fabsf(map[idx].speed_mps) : MAX_SPEED_MPS;
+    float k = omega_rad / v_est;
+    if (k < 0.01f) k = 0.01f;
+    float v_max = sqrtf(3.924f / k);  // μg/κ
+    if (v_max > MAX_SPEED_MPS) v_max = MAX_SPEED_MPS;
+
+    next_cmd.active = true;
+    next_cmd.target_speed = v_max;
+    next_cmd.feedforward_omega = 0;  // no FF on mapping lap
+    next_cmd.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+control_cmd_t mapper_get_command(void) { return next_cmd; }
+int32_t mapper_get_count(void) { return map_count; }
+const map_sample_t* mapper_get_samples(void) { return map; }
+
+void mapper_reset(void) {
+    if (lap == 0 && map_count > 0) {
+        lap_reference_length = total_dist;
+        ESP_LOGI(TAG, "Lap 0 reference length: %.3f m (%ld samples)",
+                 lap_reference_length, (long)map_count);
+    }
+    map_count = 0; total_dist = 0.0f; last_sample_dist = 0.0f; lap++;
+}
+
+int mapper_get_lap(void) { return lap; }
+float mapper_get_total_distance(void) { return total_dist; }
+
+=== main/mapper.h ===
+#pragma once
+#include "ringbuf.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+#define MAP_MAX_SAMPLES 2048
+#define MAP_SPACING_MM   5     // spatial sampling interval
+
+typedef struct {
+    float distance_m;
+    float gyro_z;           // recorded gyro rate (°/s) — replaces κ
+    float line_pos;
+    float speed_mps;
+} map_sample_t;
+
+void mapper_init(void);
+void mapper_sample(void);
+void mapper_predict(void);
+control_cmd_t mapper_get_command(void);
+
+int32_t mapper_get_count(void);
+const map_sample_t* mapper_get_samples(void);
+void mapper_reset(void);
+int mapper_get_lap(void);
+float mapper_get_total_distance(void);
+
+// Load full target profile: (gyro_ff, target_speed) pairs, interleaved
+void mapper_load_profile(const float *data, int count);
+
+=== main/motor.c ===
+#include "motor.h"
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include <math.h>
+
+static const char *TAG = "MOTOR";
+
+static const int IN1[2] = {35, 37};
+static const int IN2[2] = {36, 38};
+static const int PWM[2] = {33, 34};
+static const int STBY = 39;
+
+static float prev_throttle[2] = {0, 0};
+static uint32_t brake_countdown[2] = {0, 0};
+
+void motor_init(void) {
+    ledc_timer_config_t tmr = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 20000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&tmr);
+    for (int i = 0; i < 2; i++) {
+        ledc_channel_config_t ch = {
+            .gpio_num = PWM[i],
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = (i == 0) ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1,
+            .timer_sel = LEDC_TIMER_0,
+            .duty = 0, .hpoint = 0,
+        };
+        ledc_channel_config(&ch);
+        gpio_set_direction(IN1[i], GPIO_MODE_OUTPUT);
+        gpio_set_direction(IN2[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(IN1[i], 0);
+        gpio_set_level(IN2[i], 0);
+        prev_throttle[i] = 0;
+        brake_countdown[i] = 0;
+    }
+    gpio_set_direction(STBY, GPIO_MODE_OUTPUT);
+    gpio_set_level(STBY, 1);
+    ESP_LOGI(TAG, "TB6612FNG init OK");
+}
+
+void motor_set_speed(int channel, float throttle) {
+    if (channel < 0 || channel > 1) return;
+    ledc_channel_t ch = (channel == 0) ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1;
+
+    if (throttle > 1.0f) throttle = 1.0f;
+    if (throttle < -1.0f) throttle = -1.0f;
+    float abs_thr = fabsf(throttle);
+
+    // Smooth stop: crossing to near-zero from driving → ramp PWM down over 50ms
+    bool was_running = (fabsf(prev_throttle[channel]) > 0.02f);
+    bool stopping = (abs_thr < 0.015f);
+
+    if (stopping && was_running && brake_countdown[channel] == 0) {
+        brake_countdown[channel] = 50;
+    }
+
+    if (brake_countdown[channel] > 0) {
+        brake_countdown[channel]--;
+        gpio_set_level(IN1[channel], 0);
+        gpio_set_level(IN2[channel], 0);
+        float ramp = (float)brake_countdown[channel] / 50.0f;
+        uint32_t duty = (uint32_t)(fabsf(prev_throttle[channel]) * ramp * 1023.0f);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
+        if (brake_countdown[channel] == 0) prev_throttle[channel] = 0;
+        return;
+    }
+
+    // Normal operation
+    if (throttle > 0.015f) {
+        gpio_set_level(IN1[channel], 1);
+        gpio_set_level(IN2[channel], 0);
+    } else if (throttle < -0.015f) {
+        gpio_set_level(IN1[channel], 0);
+        gpio_set_level(IN2[channel], 1);
+    } else {
+        gpio_set_level(IN1[channel], 0);
+        gpio_set_level(IN2[channel], 0);
+    }
+
+    uint32_t duty = (uint32_t)(abs_thr * 1023.0f);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
+    prev_throttle[channel] = throttle;
+}
+
+void motor_brake(int channel) {
+    if (channel < 0 || channel > 1) return;
+    ledc_channel_t ch = (channel == 0) ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1;
+    gpio_set_level(IN1[channel], 0);
+    gpio_set_level(IN2[channel], 0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, 1023);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
+    prev_throttle[channel] = 0;
+    brake_countdown[channel] = 0;
+}
+
+void motor_coast(void) {
+    gpio_set_level(STBY, 0);
+}
+
+=== main/motor.h ===
+#pragma once
+#include <stdint.h>
+
+void motor_init(void);
+void motor_set_speed(int channel, float throttle);
+void motor_brake(int channel);
+void motor_coast(void);
+
+=== main/pid.c ===
+#include "pid.h"
+void pid_init(pid_t *pid, float kp, float ki, float kd, float limit) {
+    pid->kp=kp; pid->ki=ki; pid->kd=kd; pid->integral=0; pid->prev_error=0; pid->output_limit=limit;
+}
+float pid_update(pid_t *pid, float sp, float meas) {
+    float e = sp - meas;
+    pid->integral += e;
+    float il = pid->output_limit / (pid->ki > 0.001f ? pid->ki : 0.001f);
+    if (pid->integral > il) pid->integral = il;
+    if (pid->integral < -il) pid->integral = -il;
+    float d = e - pid->prev_error; pid->prev_error = e;
+    float o = pid->kp * e + pid->ki * pid->integral + pid->kd * d;
+    if (o > pid->output_limit) o = pid->output_limit;
+    if (o < -pid->output_limit) o = -pid->output_limit;
+    return o;
+}
+float pid_update_hold(pid_t *pid, float sp, float meas) {
+    float e = sp - meas;
+    // Keep integral frozen during saturation
+    float d = e - pid->prev_error; pid->prev_error = e;
+    float o = pid->kp * e + pid->ki * pid->integral + pid->kd * d;
+    if (o > pid->output_limit) o = pid->output_limit;
+    if (o < -pid->output_limit) o = -pid->output_limit;
+    return o;
+}
+void pid_reset(pid_t *pid) { pid->integral = 0; pid->prev_error = 0; }
+
+=== main/pid.h ===
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+typedef struct {
+    float kp, ki, kd; float integral, prev_error; float output_limit;
+} pid_t;
+void pid_init(pid_t *pid, float kp, float ki, float kd, float limit);
+float pid_update(pid_t *pid, float setpoint, float measurement);
+float pid_update_hold(pid_t *pid, float setpoint, float measurement);
+void pid_reset(pid_t *pid);
+
+=== main/ringbuf.c ===
+#include "ringbuf.h"
+#include "config.h"
+#include "esp_timer.h"
+
+static control_cmd_t buf[RINGBUF_SIZE];
+static volatile int hd = 0, tl = 0;
+
+void ringbuf_init(void) { hd = tl = 0; }
+
+void ringbuf_push(control_cmd_t cmd) {
+    int n = (hd + 1) % RINGBUF_SIZE;
+    if (n != tl) {
+        buf[hd] = cmd;
+        __sync_synchronize();
+        hd = n;
+    }
+}
+
+control_cmd_t ringbuf_pop(void) {
+    control_cmd_t e = {false, 0, 0, 0};
+    if (hd == tl) return e;
+    control_cmd_t c = buf[tl];
+    __sync_synchronize();
+    tl = (tl + 1) % RINGBUF_SIZE;
+    return c;
+}
+
+bool ringbuf_empty(void) { return hd == tl; }
+
+bool ringbuf_is_fresh(control_cmd_t cmd) {
+    if (!cmd.active) return false;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    int32_t age = (int32_t)(now - cmd.timestamp_ms);
+    return (age >= 0 && age < 15);
+}
+
+=== main/ringbuf.h ===
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+
+typedef struct {
+    bool     active;
+    float    feedforward_omega;
+    float    target_speed;
+    uint32_t timestamp_ms;
+} control_cmd_t;
+
+void     ringbuf_init(void);
+void     ringbuf_push(control_cmd_t cmd);
+control_cmd_t ringbuf_pop(void);
+bool     ringbuf_empty(void);
+bool     ringbuf_is_fresh(control_cmd_t cmd);
+
+=== main/speed_control.c ===
+#include "speed_control.h"
+#include "pid.h"
+#include "config.h"
+
+static pid_t speed_pid;
+static bool hold = false;
+
+void speed_control_init(void) {
+    pid_init(&speed_pid, SPEED_PID_KP, SPEED_PID_KI, SPEED_PID_KD, 1.0f);
+}
+
+float speed_control_update(float t, float c) {
+    return hold ? pid_update_hold(&speed_pid, t, c) : pid_update(&speed_pid, t, c);
+}
+
+void speed_hold_integral(void) { hold = true; }
+void speed_release_integral(void) { hold = false; }
+void speed_reset(void) { pid_reset(&speed_pid); hold = false; }
+
+=== main/speed_control.h ===
+#pragma once
+
+void speed_control_init(void);
+float speed_control_update(float target, float current);
+void speed_hold_integral(void);
+void speed_release_integral(void);
+void speed_reset(void);
+
+=== main/wifi.c ===
+#include "wifi.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "config.h"
+
+static const char *TAG = "WIFI";
+static int sock = -1;
+static struct sockaddr_in dest;
+
+static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
+        esp_wifi_connect();
+    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
+        esp_wifi_connect();
+    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
+        ESP_LOGI(TAG, "WiFi connected, UDP target %s:%d", WIFI_UDP_TARGET_IP, TELEMETRY_UDP_PORT);
+}
+
+void wifi_init(void) {
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, NULL);
+
+    wifi_config_t wcfg = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_start();
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(TELEMETRY_UDP_PORT);
+    dest.sin_addr.s_addr = inet_addr(WIFI_UDP_TARGET_IP);
+    ESP_LOGI(TAG, "WiFi STA init, UDP target %s:%d", WIFI_UDP_TARGET_IP, TELEMETRY_UDP_PORT);
+}
+
+void wifi_send_telemetry(float line_pos, float left_speed, float right_speed,
+                         float target_speed, float gyro_z,
+                         float ff_omega, bool running) {
+    if (sock < 0) return;
+    char buf[160];
+    int len = snprintf(buf, sizeof(buf),
+        "LP:%.2f LS:%.2f RS:%.2f TS:%.2f GZ:%.2f FF:%.2f LT:%.3f RT:%.3f RUN:%d\n",
+        line_pos, left_speed, right_speed, target_speed, gyro_z,
+        ff_omega, 0.0f, 0.0f, running ? 1 : 0);
+    sendto(sock, buf, len, 0, (struct sockaddr*)&dest, sizeof(dest));
+}
+
+=== main/wifi.h ===
+#pragma once
+#include <stdbool.h>
+
+void wifi_init(void);
+void wifi_send_telemetry(float line_pos, float left_speed, float right_speed,
+                         float target_speed, float gyro_z,
+                         float ff_omega, bool running);
+
+=== main/oled.c ===
+/**
+ * @file    oled.c
+ * @brief   OLED驱动(SSD1306) - 波特律动keysking驱动 + ESP-IDF I2C 胶水
+ *
+ * 结构:
+ *   1. ESP-IDF I2C 发送包装 (oled_i2c_send)
+ *   2. 提取的通用驱动 (s_send_func, 显存, 绘图, 文字)
+ *   3. 兼容包装 (oled_init, oled_show_splash 小写接口)
+ */
+#include "oled.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <stdlib.h>
+
+static const char *TAG = "OLED";
+
+/* ====================== ESP-IDF I2C 发送包装 ====================== */
+
+#define OLED_I2C_PORT    I2C_NUM_0
+static uint8_t s_oled_addr_7bit = 0x3C;  // 默认地址，扫描后会被覆盖
+
+static void oled_i2c_send(uint8_t *data, uint16_t len)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (s_oled_addr_7bit << 1) | I2C_MASTER_WRITE, true);
+    for (uint16_t i = 0; i < len; i++)
+        i2c_master_write_byte(cmd, data[i], true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(cmd);
+    if (ret != ESP_OK)
+        ESP_LOGE(TAG, "I2C TX fail: %s", esp_err_to_name(ret));
+}
+
+/* ====================== 器件参数 ====================== */
+
+#define OLED_ADDR    0x78   // SSD1306 I2C 地址（7位左移1位，保留供参考）
+#define OLED_PAGE    8      // 页数
+#define OLED_ROW     (8 * OLED_PAGE) // 64 行
+#define OLED_COLUMN  128     // 128 列
+
+/* ====================== 显存 ====================== */
+
+static uint8_t OLED_GRAM[OLED_PAGE][OLED_COLUMN];
+
+/* ====================== 底层 I2C 发送 ====================== */
+
+static OLED_SendFunc_t s_send_func = NULL;
+
+void OLED_SetSendFunc(OLED_SendFunc_t func)
+{
+    s_send_func = func;
+}
+
+static void OLED_Send(uint8_t *data, uint8_t len)
+{
+    if (s_send_func)
+        s_send_func(data, len);
+}
+
+static void OLED_SendCmd(uint8_t cmd)
+{
+    uint8_t buf[2] = {0x00, cmd};
+    OLED_Send(buf, 2);
+}
+
+/* ====================== 初始化 & 控制 ====================== */
+
+void OLED_Init()
+{
+    OLED_SendCmd(0xAE); // display off
+
+    OLED_SendCmd(0x20); OLED_SendCmd(0x10);
+    OLED_SendCmd(0xB0);
+    OLED_SendCmd(0xC8);
+    OLED_SendCmd(0x00); OLED_SendCmd(0x10);
+    OLED_SendCmd(0x40);
+    OLED_SendCmd(0x81); OLED_SendCmd(0xDF);
+    OLED_SendCmd(0xA1);
+    OLED_SendCmd(0xA6);
+    OLED_SendCmd(0xA8); OLED_SendCmd(0x3F);
+    OLED_SendCmd(0xA4);
+    OLED_SendCmd(0xD3); OLED_SendCmd(0x00);
+    OLED_SendCmd(0xD5); OLED_SendCmd(0xF0);
+    OLED_SendCmd(0xD9); OLED_SendCmd(0x22);
+    OLED_SendCmd(0xDA); OLED_SendCmd(0x12);
+    OLED_SendCmd(0xDB); OLED_SendCmd(0x20);
+    OLED_SendCmd(0x8D); OLED_SendCmd(0x14);
+
+    OLED_NewFrame();
+    OLED_ShowFrame();
+
+    OLED_SendCmd(0xAF); // display on
+}
+
+void OLED_DisPlay_On()
+{
+    OLED_SendCmd(0x8D); OLED_SendCmd(0x14);
+    OLED_SendCmd(0xAF);
+}
+
+void OLED_DisPlay_Off()
+{
+    OLED_SendCmd(0x8D); OLED_SendCmd(0x10);
+    OLED_SendCmd(0xAE);
+}
+
+void OLED_SetColorMode(OLED_ColorMode mode)
+{
+    OLED_SendCmd(mode == OLED_COLOR_NORMAL ? 0xA6 : 0xA7);
+}
+
+/* ====================== 显存操作 ====================== */
+
+void OLED_NewFrame()
+{
+    memset(OLED_GRAM, 0, sizeof(OLED_GRAM));
+}
+
+void OLED_ShowFrame()
+{
+    uint8_t buf[OLED_COLUMN + 1];
+    buf[0] = 0x40;
+    for (uint8_t i = 0; i < OLED_PAGE; i++)
+    {
+        OLED_SendCmd(0xB0 + i); // 设置页地址
+        OLED_SendCmd(0x00);     // 列地址低4位
+        OLED_SendCmd(0x10);     // 列地址高4位
+        memcpy(buf + 1, OLED_GRAM[i], OLED_COLUMN);
+        OLED_Send(buf, OLED_COLUMN + 1);
+    }
+}
+
+void OLED_SetPixel(uint8_t x, uint8_t y, OLED_ColorMode color)
+{
+    if (x >= OLED_COLUMN || y >= OLED_ROW)
+        return;
+    if (color == OLED_COLOR_NORMAL)
+        OLED_GRAM[y / 8][x] |= (1 << (y % 8));
+    else
+        OLED_GRAM[y / 8][x] &= ~(1 << (y % 8));
+}
+
+void OLED_SetByte_Fine(uint8_t page, uint8_t column, uint8_t data,
+                       uint8_t start, uint8_t end, OLED_ColorMode color)
+{
+    if (page >= OLED_PAGE || column >= OLED_COLUMN)
+        return;
+    if (color)
+        data = ~data;
+    uint8_t temp = data | (0xFF << (end + 1)) | (0xFF >> (8 - start));
+    OLED_GRAM[page][column] &= temp;
+    temp = data & ~(0xFF << (end + 1)) & ~(0xFF >> (8 - start));
+    OLED_GRAM[page][column] |= temp;
+}
+
+void OLED_SetByte(uint8_t page, uint8_t column, uint8_t data, OLED_ColorMode color)
+{
+    if (page >= OLED_PAGE || column >= OLED_COLUMN)
+        return;
+    OLED_GRAM[page][column] = color ? ~data : data;
+}
+
+void OLED_SetBits_Fine(uint8_t x, uint8_t y, uint8_t data,
+                       uint8_t len, OLED_ColorMode color)
+{
+    uint8_t page = y / 8;
+    uint8_t bit  = y % 8;
+    if (bit + len > 8)
+    {
+        OLED_SetByte_Fine(page,     x, data << bit,        bit, 7, color);
+        OLED_SetByte_Fine(page + 1, x, data >> (8 - bit),  0, len + bit - 1 - 8, color);
+    }
+    else
+    {
+        OLED_SetByte_Fine(page, x, data << bit, bit, bit + len - 1, color);
+    }
+}
+
+void OLED_SetBits(uint8_t x, uint8_t y, uint8_t data, OLED_ColorMode color)
+{
+    uint8_t page = y / 8;
+    uint8_t bit  = y % 8;
+    OLED_SetByte_Fine(page, x, data << bit, bit, 7, color);
+    if (bit)
+        OLED_SetByte_Fine(page + 1, x, data >> (8 - bit), 0, bit - 1, color);
+}
+
+void OLED_SetBlock(uint8_t x, uint8_t y, const uint8_t *data,
+                   uint8_t w, uint8_t h, OLED_ColorMode color)
+{
+    uint8_t fullRow = h / 8;
+    uint8_t partBit = h % 8;
+    for (uint8_t i = 0; i < w; i++)
+        for (uint8_t j = 0; j < fullRow; j++)
+            OLED_SetBits(x + i, y + j * 8, data[i + j * w], color);
+    if (partBit)
+    {
+        uint16_t fullNum = w * fullRow;
+        for (uint8_t i = 0; i < w; i++)
+            OLED_SetBits_Fine(x + i, y + (fullRow * 8), data[fullNum + i], partBit, color);
+    }
+}
+
+/* ====================== 图形绘制 ====================== */
+
+void OLED_DrawLine(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2, OLED_ColorMode color)
+{
+    if (x1 == x2)
+    {
+        if (y1 > y2) { uint8_t t = y1; y1 = y2; y2 = t; }
+        for (uint8_t y = y1; y <= y2; y++) OLED_SetPixel(x1, y, color);
+    }
+    else if (y1 == y2)
+    {
+        if (x1 > x2) { uint8_t t = x1; x1 = x2; x2 = t; }
+        for (uint8_t x = x1; x <= x2; x++) OLED_SetPixel(x, y1, color);
+    }
+    else
+    {
+        // Bresenham
+        int16_t dx = x2 - x1, dy = y2 - y1;
+        int16_t ux = ((dx > 0) << 1) - 1;
+        int16_t uy = ((dy > 0) << 1) - 1;
+        int16_t x = x1, y = y1, eps = 0;
+        dx = abs(dx); dy = abs(dy);
+        if (dx > dy)
+        {
+            for (x = x1; x != x2; x += ux)
+            {
+                OLED_SetPixel(x, y, color);
+                eps += dy;
+                if ((eps << 1) >= dx) { y += uy; eps -= dx; }
+            }
+        }
+        else
+        {
+            for (y = y1; y != y2; y += uy)
+            {
+                OLED_SetPixel(x, y, color);
+                eps += dx;
+                if ((eps << 1) >= dy) { x += ux; eps -= dy; }
+            }
+        }
+    }
+}
+
+void OLED_DrawRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, OLED_ColorMode color)
+{
+    OLED_DrawLine(x, y, x + w, y, color);
+    OLED_DrawLine(x, y + h, x + w, y + h, color);
+    OLED_DrawLine(x, y, x, y + h, color);
+    OLED_DrawLine(x + w, y, x + w, y + h, color);
+}
+
+void OLED_DrawFilledRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, OLED_ColorMode color)
+{
+    for (uint8_t i = 0; i < h; i++)
+        OLED_DrawLine(x, y + i, x + w, y + i, color);
+}
+
+void OLED_DrawTriangle(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2,
+                       uint8_t x3, uint8_t y3, OLED_ColorMode color)
+{
+    OLED_DrawLine(x1, y1, x2, y2, color);
+    OLED_DrawLine(x2, y2, x3, y3, color);
+    OLED_DrawLine(x3, y3, x1, y1, color);
+}
+
+void OLED_DrawFilledTriangle(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2,
+                             uint8_t x3, uint8_t y3, OLED_ColorMode color)
+{
+    uint8_t a = 0, b = 0, y = 0, last = 0;
+    if (y1 > y2) { a = y2; b = y1; } else { a = y1; b = y2; }
+    y = a;
+    for (; y <= b; y++)
+    {
+        if (y <= y3)
+            OLED_DrawLine(x1 + (int32_t)(y - y1) * (x2 - x1) / (y2 - y1), y,
+                          x1 + (int32_t)(y - y1) * (x3 - x1) / (y3 - y1), y, color);
+        else { last = y - 1; break; }
+    }
+    for (; y <= b; y++)
+        OLED_DrawLine(x2 + (int32_t)(y - y2) * (x3 - x2) / (y3 - y2), y,
+                      x1 + (int32_t)(y - last) * (x3 - x1) / (y3 - last), y, color);
+}
+
+void OLED_DrawCircle(uint8_t x, uint8_t y, uint8_t r, OLED_ColorMode color)
+{
+    int16_t a = 0, b = r, di = 3 - (r << 1);
+    while (a <= b)
+    {
+        OLED_SetPixel(x - b, y - a, color); OLED_SetPixel(x + b, y - a, color);
+        OLED_SetPixel(x - a, y + b, color); OLED_SetPixel(x - b, y - a, color);
+        OLED_SetPixel(x - a, y - b, color); OLED_SetPixel(x + b, y + a, color);
+        OLED_SetPixel(x + a, y - b, color); OLED_SetPixel(x + a, y + b, color);
+        OLED_SetPixel(x - b, y + a, color);
+        a++;
+        if (di < 0) di += 4 * a + 6;
+        else { di += 10 + 4 * (a - b); b--; }
+        OLED_SetPixel(x + a, y + b, color);
+    }
+}
+
+void OLED_DrawFilledCircle(uint8_t x, uint8_t y, uint8_t r, OLED_ColorMode color)
+{
+    int16_t a = 0, b = r, di = 3 - (r << 1);
+    while (a <= b)
+    {
+        for (int16_t i = x - b; i <= x + b; i++)
+        { OLED_SetPixel(i, y + a, color); OLED_SetPixel(i, y - a, color); }
+        for (int16_t i = x - a; i <= x + a; i++)
+        { OLED_SetPixel(i, y + b, color); OLED_SetPixel(i, y - b, color); }
+        a++;
+        if (di < 0) di += 4 * a + 6;
+        else { di += 10 + 4 * (a - b); b--; }
+    }
+}
+
+/* 椭圆：中点算法，全整数 */
+void OLED_DrawEllipse(uint8_t cx, uint8_t cy, uint8_t a, uint8_t b, OLED_ColorMode color)
+{
+    int16_t x = 0, y = b;
+    int32_t a2 = (int32_t)a * a, b2 = (int32_t)b * b;
+    int32_t d = b2 + a2 * (1 - 2 * b) / 4;
+    while (a2 * y > b2 * x)
+    {
+        OLED_SetPixel(cx + x, cy + y, color); OLED_SetPixel(cx - x, cy + y, color);
+        OLED_SetPixel(cx + x, cy - y, color); OLED_SetPixel(cx - x, cy - y, color);
+        if (d < 0)
+        {
+            d += b2 * ((x << 1) + 3);
+            x++;
+        }
+        else
+        {
+            d += b2 * ((x << 1) + 3) + a2 * (-(y << 1) + 2);
+            x++; y--;
+        }
+    }
+    d = b2 * (x + 1) * (x + 1) / 4 + a2 * (y - 1) * (y - 1) - a2 * b2;
+    while (y > 0)
+    {
+        OLED_SetPixel(cx + x, cy + y, color); OLED_SetPixel(cx - x, cy + y, color);
+        OLED_SetPixel(cx + x, cy - y, color); OLED_SetPixel(cx - x, cy - y, color);
+        if (d < 0)
+        {
+            d += b2 * ((x << 1) + 2) + a2 * (-(y << 1) + 3);
+            x++; y--;
+        }
+        else
+        {
+            d += a2 * (-(y << 1) + 3);
+            y--;
+        }
+    }
+}
+
+void OLED_DrawImage(uint8_t x, uint8_t y, const Image *img, OLED_ColorMode color)
+{
+    OLED_SetBlock(x, y, img->data, img->w, img->h, color);
+}
+
+/* ====================== 文字绘制 ====================== */
+
+void OLED_PrintASCIIChar(uint8_t x, uint8_t y, char ch,
+                         const ASCIIFont *font, OLED_ColorMode color)
+{
+    OLED_SetBlock(x, y,
+        font->chars + (ch - ' ') * (((font->h + 7) / 8) * font->w),
+        font->w, font->h, color);
+}
+
+void OLED_PrintASCIIString(uint8_t x, uint8_t y, char *str,
+                           const ASCIIFont *font, OLED_ColorMode color)
+{
+    while (*str)
+    {
+        OLED_PrintASCIIChar(x, y, *str, font, color);
+        x += font->w;
+        str++;
+    }
+}
+
+/* UTF-8 编码长度 */
+static uint8_t _OLED_GetUTF8Len(char *s)
+{
+    if ((s[0] & 0x80) == 0x00) return 1;
+    if ((s[0] & 0xE0) == 0xC0) return 2;
+    if ((s[0] & 0xF0) == 0xE0) return 3;
+    if ((s[0] & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+void OLED_PrintString(uint8_t x, uint8_t y, char *str,
+                      const Font *font, OLED_ColorMode color)
+{
+    uint16_t i = 0;
+    uint8_t oneLen = (((font->h + 7) / 8) * font->w) + 4;
+    uint8_t found, utf8Len;
+    uint8_t *head;
+
+    while (str[i])
+    {
+        found = 0;
+        utf8Len = _OLED_GetUTF8Len(str + i);
+        if (utf8Len == 0) break;
+
+        for (uint8_t j = 0; j < font->len; j++)
+        {
+            head = (uint8_t *)(font->chars) + (j * oneLen);
+            if (memcmp(str + i, head, utf8Len) == 0)
+            {
+                OLED_SetBlock(x, y, head + 4, font->w, font->h, color);
+                x += font->w;
+                i += utf8Len;
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+        {
+            if (utf8Len == 1)
+                OLED_PrintASCIIChar(x, y, str[i], font->ascii, color);
+            else
+                OLED_PrintASCIIChar(x, y, ' ', font->ascii, color);
+            x += font->ascii->w;
+            i += utf8Len;
+        }
+    }
+}
+
+/* ====================== 兼容包装（项目原有小写接口） ====================== */
+
+void oled_init(void)
+{
+    // I2C 总线扫描：检测 OLED 地址（0x3C 或 0x3D）
+    uint8_t test_addrs[] = {0x3C, 0x3D};
+    bool found = false;
+    for (int i = 0; i < sizeof(test_addrs); i++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (test_addrs[i] << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(20));
+        i2c_cmd_link_delete(cmd);
+        if (ret == ESP_OK) {
+            s_oled_addr_7bit = test_addrs[i];
+            ESP_LOGI(TAG, "OLED found at 0x%02X", test_addrs[i]);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ESP_LOGE(TAG, "OLED not detected on I2C bus! Check wiring/power (SDA=16, SCL=15)");
+    }
+
+    OLED_SetSendFunc(oled_i2c_send);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    OLED_Init();
+    ESP_LOGI(TAG, "Initialized at 0x%02X", s_oled_addr_7bit);
+}
+
+void oled_show_splash(void)
+{
+    OLED_NewFrame();
+    OLED_PrintString(20, 45, "动次嗒次队", &font15x20, OLED_COLOR_NORMAL);
+    OLED_DrawImage(37, 0, &m0Img, OLED_COLOR_NORMAL);
+    OLED_ShowFrame();
+    ESP_LOGI(TAG, "Splash shown");
+}
+
+/* ====================== 图片轮播 + 队名显示任务 ====================== */
+
+static void oled_carousel_task(void *arg)
+{
+    const Image *images[] = {
+        &m0Img, &m1Img, &m2Img, &m3Img, &m4Img, &m5Img
+    };
+    const int img_count = sizeof(images) / sizeof(images[0]);
+    int img_id = 0;
+
+    ESP_LOGI(TAG, "Carousel task started, %d images", img_count);
+
+    while (1) {
+        OLED_NewFrame();
+        OLED_PrintString(25, 45, "动次嗒次队", &font15x20, OLED_COLOR_NORMAL);
+
+        const Image *img = images[img_id];
+        uint8_t x = (img_id == 1) ? 39 : 37;   // 与原 example 一致
+        OLED_DrawImage(x, 0, img, OLED_COLOR_NORMAL);
+
+        OLED_ShowFrame();
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+        img_id = (img_id + 1) % img_count;
+    }
+}
+
+void oled_start_carousel_task(void)
+{
+    xTaskCreatePinnedToCore(oled_carousel_task, "oled_carousel", 3072, NULL,
+                            tskIDLE_PRIORITY + 1, NULL, 0);
+}
+
+=== main/oled.h ===
+/**
+ * @file oled.h
+ * @brief OLED驱动(SSD1306) - 提取自 STM32F103 工程，已清理依赖
+ *
+ * 主要修改:
+ *   1. 去掉 #include "main.h" 依赖，改用 <stdint.h> <string.h>
+ *   2. 提取 I2C 发送接口为可配置回调（OLED_SetSendFunc / 宏）
+ *   3. 保留所有绘图/文字 API 不变
+ */
+#ifndef __OLED_H__
+#define __OLED_H__
+
+#include "font.h"
+#include <stdint.h>
+#include <string.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ========== 移植接口（二选一） ========== */
+
+/**
+ * @brief I2C 发送函数指针类型
+ * @param data 数据指针
+ * @param len  数据长度
+ *
+ * 用户在初始化前调用 OLED_SetSendFunc() 注册底层发送函数。
+ * 若不想用函数指针，直接修改 oled.c 中的 OLED_Send() 函数体。
+ */
+typedef void (*OLED_SendFunc_t)(uint8_t *data, uint16_t len);
+void OLED_SetSendFunc(OLED_SendFunc_t func);
+
+/* ========== 颜色模式 ========== */
+
+typedef enum {
+  OLED_COLOR_NORMAL = 0, // 正常模式 黑底白字
+  OLED_COLOR_REVERSED    // 反色模式 白底黑字
+} OLED_ColorMode;
+
+/* ========== 初始化 & 控制 ========== */
+
+void OLED_Init();
+void OLED_DisPlay_On();
+void OLED_DisPlay_Off();
+void OLED_SetColorMode(OLED_ColorMode mode);
+
+/* ========== 显存操作 ========== */
+
+void OLED_NewFrame();
+void OLED_ShowFrame();
+void OLED_SetPixel(uint8_t x, uint8_t y, OLED_ColorMode color);
+
+/* ========== 图形绘制 ========== */
+
+void OLED_DrawLine(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2, OLED_ColorMode color);
+void OLED_DrawRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, OLED_ColorMode color);
+void OLED_DrawFilledRectangle(uint8_t x, uint8_t y, uint8_t w, uint8_t h, OLED_ColorMode color);
+void OLED_DrawTriangle(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2, uint8_t x3, uint8_t y3, OLED_ColorMode color);
+void OLED_DrawFilledTriangle(uint8_t x1, uint8_t y1, uint8_t x2, uint8_t y2, uint8_t x3, uint8_t y3, OLED_ColorMode color);
+void OLED_DrawCircle(uint8_t x, uint8_t y, uint8_t r, OLED_ColorMode color);
+void OLED_DrawFilledCircle(uint8_t x, uint8_t y, uint8_t r, OLED_ColorMode color);
+void OLED_DrawEllipse(uint8_t x, uint8_t y, uint8_t a, uint8_t b, OLED_ColorMode color);
+void OLED_DrawImage(uint8_t x, uint8_t y, const Image *img, OLED_ColorMode color);
+
+/* ========== 文字绘制 ========== */
+
+void OLED_PrintASCIIChar(uint8_t x, uint8_t y, char ch, const ASCIIFont *font, OLED_ColorMode color);
+void OLED_PrintASCIIString(uint8_t x, uint8_t y, char *str, const ASCIIFont *font, OLED_ColorMode color);
+void OLED_PrintString(uint8_t x, uint8_t y, char *str, const Font *font, OLED_ColorMode color);
+
+/* ========== 底层字节操作（通常不需要直接调用） ========== */
+
+void OLED_SetByte(uint8_t page, uint8_t column, uint8_t data, OLED_ColorMode color);
+void OLED_SetByte_Fine(uint8_t page, uint8_t column, uint8_t data, uint8_t start, uint8_t end, OLED_ColorMode color);
+void OLED_SetBits(uint8_t x, uint8_t y, uint8_t data, OLED_ColorMode color);
+void OLED_SetBits_Fine(uint8_t x, uint8_t y, uint8_t data, uint8_t len, OLED_ColorMode color);
+void OLED_SetBlock(uint8_t x, uint8_t y, const uint8_t *data, uint8_t w, uint8_t h, OLED_ColorMode color);
+
+/* ========== 兼容包装（项目原有小写命名） ========== */
+
+void oled_init(void);
+void oled_show_splash(void);
+
+/**
+ * @brief 启动 OLED 图片轮播 + 队名显示任务
+ *
+ * 在 Core 0 上创建一个后台任务，按 300ms 间隔循环显示 6 张图片，
+ * 底部固定显示 "动次嗒次队"。任务内部每帧都会 OLED_NewFrame() 清屏
+ * 再 OLED_ShowFrame() 刷新，解决只显示不刷新的问题。
+ */
+void oled_start_carousel_task(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // __OLED_H__
+
+=== main/main.c ===
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/pulse_cnt.h"
+#include "driver/i2c.h"
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "nvs_flash.h"
+// #include "esp_wifi.h"
+// #include "esp_event.h"
+// #include "esp_netif.h"
+// #include "lwip/sockets.h"
+#include "oled.h"
+
+static const char *TAG = "MAIN";
+
+/* BARE_OLED_TEST: 只跑 OLED + UART，验证 DIO flash + 无 PSRAM 稳定性 */
+#define BARE_OLED_TEST 1
+
+// ================== 配置定义 ==================
+#define CONTROL_LOOP_HZ       1000
+#define CONTROL_DT            0.001f
+#define MAX_SPEED_MPS         3.0f
+#define WHEEL_DIAMETER_MM     22.0f
+#define ENCODER_GEAR_RATIO    10.0f
+#define PULSES_PER_REV        40
+#define TRACK_WIDTH_MM        160.0f
+#define MAP_SAMPLE_RATE_HZ    100
+#define RINGBUF_SIZE          512
+#define TELEMETRY_UDP_PORT    3333
+#define COMMAND_UDP_PORT      3334
+#define WIFI_SSID             "mcy4"
+#define WIFI_PASS             "mcy12306"
+#define SPEED_PID_KP          1.5f
+#define SPEED_PID_KI          0.1f
+#define SPEED_PID_KD          0.05f
+#define LINE_PID_KP           2.0f
+#define LINE_PID_KI           0.2f
+#define LINE_PID_KD           0.1f
+#define I2C_MASTER_SDA_IO     16
+#define I2C_MASTER_SCL_IO     15
+#define I2C_MASTER_NUM        I2C_NUM_0
+#define IMU_ADDR              0x68
+#define OLED_ADDR             0x3C
+#define LEDC_CH0_GPIO         33
+#define LEDC_CH1_GPIO         34
+#define LEDC_FREQ_HZ          20000
+#define LEDC_RESOLUTION       LEDC_TIMER_10_BIT
+#define MOTOR_L_IN1           35
+#define MOTOR_L_IN2           36
+#define MOTOR_R_IN1           37
+#define MOTOR_R_IN2           38
+#define MOTOR_STBY            39
+#define START_BUTTON_GPIO     9
+#define UART_TX_GPIO          43
+#define UART_RX_GPIO          44
+#define I2C_MASTER_FREQ_HZ    400000
+#define IMU_ADDR              0x68
+#define OLED_ADDR             0x3C
+#define LEDC_CH0_GPIO         33
+#define LEDC_CH1_GPIO         34
+#define LEDC_FREQ_HZ          20000
+#define LEDC_RESOLUTION       LEDC_TIMER_10_BIT
+#define MOTOR_L_IN1           35
+#define MOTOR_L_IN2           36
+#define MOTOR_R_IN1           37
+#define MOTOR_R_IN2           38
+#define MOTOR_STBY            39
+#define START_BUTTON_GPIO     9
+#define UART_TX_GPIO          43
+#define UART_RX_GPIO          44
+#define PROFILE_STEP_M        0.01f
+#define UART_RXBUF_SIZE       20480
+#define WATCHDOG_TIMEOUT_MS   500
+#define BUTTON_DEBOUNCE_MS    50
+
+// ================== 状态机 ==================
+typedef enum {
+    STATE_IDLE = 0,
+    STATE_ARMED,
+    STATE_RUNNING
+} system_state_t;
+
+static volatile system_state_t sys_state = STATE_IDLE;
+static volatile uint32_t    g_watchdog_last_ms = 0;
+static volatile bool        g_button_pressed = false;
+
+// ================== 数据结构 ==================
+typedef struct {
+    float kp, ki, kd;
+    float integral, prev_error;
+    float output_limit;
+} PidHandle;
+
+typedef struct {
+    bool     active;
+    float    feedforward_omega;   // deg/s, scaled for target speed
+    float    target_speed;        // m/s
+    float    curvature;           // legacy
+    uint32_t timestamp_ms;        // for freshness check
+} control_cmd_t;
+
+typedef struct {
+    float distance_m;
+    float line_pos;
+    float curvature;
+    float speed_mps;
+} map_sample_t;
+
+// ================== 全局变量 ==================
+static PidHandle           speed_pid, line_pid;
+static int16_t             enc_last[2] = {0, 0};
+static pcnt_unit_handle_t  pcnt_unit[2] = {NULL, NULL};
+static adc_oneshot_unit_handle_t adc_handle = NULL;
+static float  gyro_z_off    = 0.0f;
+static float  last_line_pos = 0.0f;
+EXT_RAM_BSS_ATTR static map_sample_t  map_data[2048];
+static int           map_count     = 0;
+static float         total_distance = 0.0f;
+static int           lap_count     = 0;
+EXT_RAM_BSS_ATTR static float         profile[2048];
+static int           profile_len   = 0;
+EXT_RAM_BSS_ATTR static control_cmd_t ringbuf[RINGBUF_SIZE];
+static volatile int  ring_hd = 0, ring_tl = 0;
+static volatile float cur_lp = 0, cur_ls = 0, cur_rs = 0, cur_ts = 0, cur_gz = 0, cur_lt = 0, cur_rt = 0;
+static char          uart_rxbuf[UART_RXBUF_SIZE];
+static bool    motor_ramp_active = false;
+static int32_t motor_ramp_step   = 0;
+static int32_t motor_ramp_thr[2] = {0, 0};
+static float   g_vbat_comp       = 1.0f;
+
+// ================== 环形缓冲区 ==================
+void ringbuf_init(void) { ring_hd = ring_tl = 0; }
+
+void ringbuf_push(control_cmd_t cmd) {
+    int n = (ring_hd + 1) % RINGBUF_SIZE;
+    if (n != ring_tl) { ringbuf[ring_hd] = cmd; ring_hd = n; }
+}
+
+control_cmd_t ringbuf_pop(void) {
+    control_cmd_t e = {false, 0, MAX_SPEED_MPS, 0, 0};
+    if (ring_hd == ring_tl) return e;
+    control_cmd_t c = ringbuf[ring_tl];
+    ring_tl = (ring_tl + 1) % RINGBUF_SIZE;
+    return c;
+}
+
+bool ringbuf_is_fresh(control_cmd_t *cmd) {
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    return (now - cmd->timestamp_ms) < 15;
+}
+
+// ================== PID 控制 ==================
+void pid_init(PidHandle *pid, float kp, float ki, float kd, float limit) {
+    pid->kp = kp; pid->ki = ki; pid->kd = kd;
+    pid->integral = 0; pid->prev_error = 0; pid->output_limit = limit;
+}
+
+float pid_update_hold(PidHandle *pid, float setpoint, float measurement, bool hold) {
+    float error = setpoint - measurement;
+    if (!hold) {
+        pid->integral += error;
+        float int_limit = (pid->ki > 0) ? (pid->output_limit / pid->ki) : 0;
+        if (pid->integral >  int_limit) pid->integral =  int_limit;
+        if (pid->integral < -int_limit) pid->integral = -int_limit;
+    }
+    float derivative = error - pid->prev_error;
+    pid->prev_error = error;
+    float output = pid->kp * error + pid->ki * pid->integral + pid->kd * derivative;
+    if (output >  pid->output_limit) return  pid->output_limit;
+    if (output < -pid->output_limit) return -pid->output_limit;
+    return output;
+}
+
+// ================== 硬件初始化 ==================
+void i2c_master_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num  = I2C_MASTER_SDA_IO,
+        .scl_io_num  = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+}
+
+void ledc_init(void) {
+    ledc_timer_config_t timer_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num  = LEDC_TIMER_0,
+        .duty_resolution = LEDC_RESOLUTION,
+        .freq_hz    = LEDC_FREQ_HZ,
+        .clk_cfg    = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&timer_conf);
+    ledc_channel_config_t ch_conf = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_sel  = LEDC_TIMER_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .duty  = 0,
+        .hpoint = 0,
+    };
+    ch_conf.channel = LEDC_CHANNEL_0; ch_conf.gpio_num = LEDC_CH0_GPIO;
+    ledc_channel_config(&ch_conf);
+    ch_conf.channel = LEDC_CHANNEL_1; ch_conf.gpio_num = LEDC_CH1_GPIO;
+    ledc_channel_config(&ch_conf);
+}
+
+void pcnt_init_unit(int ch, int pinA, int pinB) {
+    pcnt_unit_config_t unit_cfg = { .low_limit = -32767, .high_limit = 32767 };
+    pcnt_new_unit(&unit_cfg, &pcnt_unit[ch]);
+    pcnt_glitch_filter_config_t filt_cfg = { .max_glitch_ns = 1000 };
+    pcnt_unit_set_glitch_filter(pcnt_unit[ch], &filt_cfg);
+    pcnt_chan_config_t chan_cfg_a = { .edge_gpio_num = pinA, .level_gpio_num = pinB };
+    pcnt_chan_config_t chan_cfg_b = { .edge_gpio_num = pinB, .level_gpio_num = pinA };
+    pcnt_channel_handle_t ch_a = NULL, ch_b = NULL;
+    pcnt_new_channel(pcnt_unit[ch], &chan_cfg_a, &ch_a);
+    pcnt_new_channel(pcnt_unit[ch], &chan_cfg_b, &ch_b);
+    pcnt_channel_set_edge_action(ch_a, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD);
+    pcnt_channel_set_level_action(ch_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    pcnt_channel_set_edge_action(ch_b, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD);
+    pcnt_channel_set_level_action(ch_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    pcnt_unit_enable(pcnt_unit[ch]);
+    pcnt_unit_clear_count(pcnt_unit[ch]);
+    pcnt_unit_start(pcnt_unit[ch]);
+}
+
+// ================== 电机驱动 ==================
+void motor_init(void) {
+    gpio_set_direction(MOTOR_L_IN1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_L_IN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_R_IN1, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_R_IN2, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MOTOR_STBY, GPIO_MODE_OUTPUT);
+    gpio_set_level(MOTOR_STBY, 1);
+}
+
+void motor_set_speed(int ch, int32_t throttle) {
+    if (throttle > 100)  throttle = 100;
+    if (throttle < -100) throttle = -100;
+    int in1 = (ch == 0) ? MOTOR_L_IN1 : MOTOR_R_IN1;
+    int in2 = (ch == 0) ? MOTOR_L_IN2 : MOTOR_R_IN2;
+    if (throttle > 0) {
+        gpio_set_level(in1, 1); gpio_set_level(in2, 0);
+    } else if (throttle < 0) {
+        gpio_set_level(in1, 0); gpio_set_level(in2, 1);
+        throttle = -throttle;
+    } else {
+        gpio_set_level(in1, 0); gpio_set_level(in2, 0);
+    }
+    uint32_t duty = (throttle * 1023) / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, ch == 0 ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, ch == 0 ? LEDC_CHANNEL_0 : LEDC_CHANNEL_1);
+}
+
+void motor_coast(void) {
+    gpio_set_level(MOTOR_L_IN1, 0); gpio_set_level(MOTOR_L_IN2, 0);
+    gpio_set_level(MOTOR_R_IN1, 0); gpio_set_level(MOTOR_R_IN2, 0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    motor_ramp_active = false;
+}
+
+// ================== 电池电压补偿标定 ==================
+#define VBAT_NOMINAL_MPS 2.0f
+#define VBAT_COMP_MIN    0.7f
+#define VBAT_COMP_MAX    1.3f
+
+float encoder_get_speed(int ch);  // forward declaration
+
+static void vbat_calibrate(void) {
+    ESP_LOGI(TAG, "VBAT cal: start (lift wheels off ground)");
+    // reset encoder counters before measurement
+    for (int ch = 0; ch < 2; ch++) {
+        pcnt_unit_clear_count(pcnt_unit[ch]);
+        enc_last[ch] = 0;
+    }
+    motor_set_speed(0, 100);
+    motor_set_speed(1, 100);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    float l = encoder_get_speed(0);
+    float r = encoder_get_speed(1);
+    motor_coast();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    float avg = (l + r) * 0.5f;
+    if (avg > 0.3f) {
+        g_vbat_comp = VBAT_NOMINAL_MPS / avg;
+        if (g_vbat_comp > VBAT_COMP_MAX) g_vbat_comp = VBAT_COMP_MAX;
+        if (g_vbat_comp < VBAT_COMP_MIN) g_vbat_comp = VBAT_COMP_MIN;
+    } else {
+        ESP_LOGW(TAG, "VBAT cal: wheels not spinning? keeping comp=1.0");
+        g_vbat_comp = 1.0f;
+    }
+    ESP_LOGI(TAG, "VBAT cal: L=%.2f R=%.2f m/s  comp=%.3f", l, r, (double)g_vbat_comp);
+}
+
+// ================== GPIO 9 启动按钮 ISR ==================
+static void IRAM_ATTR start_button_isr(void *arg) {
+    g_button_pressed = true;
+}
+
+void start_button_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << START_BUTTON_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    gpio_isr_handler_add(START_BUTTON_GPIO, start_button_isr, NULL);
+    ESP_LOGI(TAG, "Start button on GPIO %d (neg edge, pull-up)", START_BUTTON_GPIO);
+}
+
+static void handle_button_press(void) {
+    static uint32_t last_press_tick = 0;
+    uint32_t now = xTaskGetTickCount();
+    if (now - last_press_tick < pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) return;
+    last_press_tick = now;
+
+    if (sys_state == STATE_ARMED) {
+        sys_state = STATE_RUNNING;
+        pid_init(&speed_pid, SPEED_PID_KP, SPEED_PID_KI, SPEED_PID_KD, 100.0f);
+        pid_init(&line_pid,  LINE_PID_KP,  LINE_PID_KI,  LINE_PID_KD,  50.0f);
+        ringbuf_init();
+        motor_ramp_active = false;
+        g_watchdog_last_ms = xTaskGetTickCount();
+        ESP_LOGI(TAG, ">>> RUNNING (button)");
+    }
+}
+
+// ================== 编码器 ==================
+void encoder_init(void) {
+    pcnt_init_unit(0, 17, 18);
+    // encoder ch1 (gpio 21/22) may fail on some boards — skip gracefully
+    pcnt_unit_config_t unit_cfg = { .low_limit = -32767, .high_limit = 32767 };
+    esp_err_t ret = pcnt_new_unit(&unit_cfg, &pcnt_unit[1]);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "encoder ch1: pcnt_new_unit failed (%s), skipping", esp_err_to_name(ret));
+        return;
+    }
+    pcnt_glitch_filter_config_t filt_cfg = { .max_glitch_ns = 1000 };
+    pcnt_unit_set_glitch_filter(pcnt_unit[1], &filt_cfg);
+    ret = pcnt_unit_enable(pcnt_unit[1]);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "encoder ch1: enable failed, skipping");
+        return;
+    }
+    pcnt_unit_clear_count(pcnt_unit[1]);
+    pcnt_unit_start(pcnt_unit[1]);
+    ESP_LOGI(TAG, "encoder ch1 running on fallback (no quadrature)");
+}
+
+float encoder_get_speed(int ch) {
+    if (!pcnt_unit[ch]) return 0.0f;
+    int count = 0;
+    pcnt_unit_get_count(pcnt_unit[ch], &count);
+    int d = count - enc_last[ch];
+    enc_last[ch] = count;
+    return d * 0.172787f;
+}
+
+// ================== 灰度传感器 ==================
+void grayscale_init(void) {
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = ADC_UNIT_1,
+        .clk_src = ADC_DIGI_CLK_SRC_DEFAULT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    adc_oneshot_new_unit(&init_cfg, &adc_handle);
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    for (int i = 0; i < 8; i++) {
+        adc_oneshot_config_channel(adc_handle, i, &chan_cfg);
+    }
+}
+
+float grayscale_get_line_position(void) {
+    int raw[8];
+    float ws = 0, t = 0;
+    for (int i = 0; i < 8; i++) {
+        adc_oneshot_read(adc_handle, i, &raw[i]);
+        ws += (float)i * raw[i];
+        t  += raw[i];
+    }
+    if (t < 10.0f) return last_line_pos;
+    last_line_pos = (ws / t) - 3.5f;
+    return last_line_pos;
+}
+
+// ================== IMU ==================
+static esp_err_t i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
+    i2c_cmd_handle_t c = i2c_cmd_link_create();
+    i2c_master_start(c);
+    i2c_master_write_byte(c, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(c, reg, true);
+    i2c_master_write_byte(c, val, true);
+    i2c_master_stop(c);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, c, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(c);
+    return ret;
+}
+
+static int16_t i2c_read_int16(uint8_t addr, uint8_t reg) {
+    uint8_t b[2];
+    i2c_cmd_handle_t c = i2c_cmd_link_create();
+    i2c_master_start(c);
+    i2c_master_write_byte(c, (addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(c, reg, true);
+    i2c_master_stop(c);
+    i2c_master_cmd_begin(I2C_MASTER_NUM, c, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(c);
+    c = i2c_cmd_link_create();
+    i2c_master_start(c);
+    i2c_master_write_byte(c, (addr << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(c, &b[0], I2C_MASTER_ACK);
+    i2c_master_read_byte(c, &b[1], I2C_MASTER_NACK);
+    i2c_master_stop(c);
+    i2c_master_cmd_begin(I2C_MASTER_NUM, c, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(c);
+    return (int16_t)((b[0] << 8) | b[1]);
+}
+
+void imu_init(void) {
+    i2c_write_reg(IMU_ADDR, 0x6B, 0x00);
+}
+
+void imu_calibrate(void) {
+    gyro_z_off = 0;
+    float sum = 0;
+    for (int i = 0; i < 100; i++) {
+        sum += i2c_read_int16(IMU_ADDR, 0x47) / 65.5f;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    gyro_z_off = sum / 100.0f;
+}
+
+float imu_get_gyro_z(void) {
+    return (i2c_read_int16(IMU_ADDR, 0x47) / 65.5f - gyro_z_off) * M_PI / 180.0f;
+}
+
+// ================== Mapper ==================
+void mapper_sample(float avg_spd, float line_pos, float gyro_z) {
+    if (map_count < 2048 && sys_state == STATE_RUNNING) {
+        float dist_inc = avg_spd * 0.01f;
+        total_distance += dist_inc;
+        float curv = 0.0f;
+        if (avg_spd > 0.2f) curv = gyro_z / avg_spd;
+        map_data[map_count].distance_m = total_distance;
+        map_data[map_count].line_pos   = line_pos;
+        map_data[map_count].curvature  = curv;
+        map_data[map_count].speed_mps  = avg_spd;
+        map_count++;
+    }
+}
+
+control_cmd_t mapper_predict(float current_dist, float avg_spd) {
+    control_cmd_t cmd = {false, 0, MAX_SPEED_MPS, 0, 0};
+    if (profile_len > 0 && sys_state == STATE_RUNNING) {
+        float look_ahead = current_dist + 0.15f;
+        int p_idx = (int)(look_ahead / PROFILE_STEP_M);
+        if (p_idx >= 0 && p_idx < profile_len) {
+            cmd.active        = true;
+            cmd.target_speed  = profile[p_idx];
+            int low = 0, high = map_count - 1, idx = -1;
+            while (low <= high) {
+                int mid = low + (high - low) / 2;
+                if (map_data[mid].distance_m < look_ahead) { idx = mid; low = mid + 1; }
+                else { high = mid - 1; }
+            }
+            float k = (idx != -1) ? map_data[idx].curvature : 0.0f;
+            cmd.curvature         = k;
+            cmd.feedforward_omega = k * cmd.target_speed;
+            cmd.timestamp_ms      = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        }
+    }
+    return cmd;
+}
+
+void mapper_reset(void) {
+    map_count = 0; total_distance = 0.0f; lap_count = 0;
+}
+
+// ================== WiFi & UDP ==================
+static volatile bool wifi_ready = false;
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
+        esp_wifi_connect();
+    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
+        esp_wifi_connect();
+    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
+        ESP_LOGI(TAG, "WiFi connected, got IP");
+}
+
+esp_err_t wifi_init(void) {
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    wifi_ready = true;
+    ESP_LOGI(TAG, "WiFi init done");
+    return ESP_OK;
+}
+
+void wifi_send_telemetry(float lp, float ls, float rs, float ts, float gz, float lt, float rt) {
+    static int sock = -1;
+    if (sock < 0) {
+        sock = socket(AF_INET, SOCK_DGRAM, 0);
+        int broadcast = 1;
+        setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    }
+    char buf[128];
+    int len = sprintf(buf, "LP:%.2f LS:%.2f RS:%.2f TS:%.2f GZ:%.1f LT:%.2f RT:%.2f RUN:%d\n",
+                      lp, ls, rs, ts, gz, lt, rt, (sys_state == STATE_RUNNING) ? 1 : 0);
+    struct sockaddr_in dest;
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(TELEMETRY_UDP_PORT);
+    dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    sendto(sock, buf, len, 0, (struct sockaddr *)&dest, sizeof(dest));
+}
+
+// ================== UART 命令处理 ==================
+static uint8_t hex_to_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+// 通用命令处理器，结果写入 out，返回长度
+static int process_command(char *cmd, char *out, int out_max) {
+    // ── 状态查询 / 数据导出 ──
+    if (strcmp(cmd, "map") == 0) {
+        // map 数据量大, 通过串口逐条写出后仍返回总结 JSON
+        char buf[256]; int len;
+        len = sprintf(buf, "{\"lap\":%d,\"total_dist_m\":%.2f,\"n\":%d,\"samples\":[",
+                      lap_count, total_distance, map_count);
+        uart_write_bytes(UART_NUM_0, buf, len);
+        for (int i = 0; i < map_count; i++) {
+            len = sprintf(buf, "{\"d\":%.2f,\"g\":%.4f,\"p\":%.2f,\"v\":%.2f}%s",
+                          map_data[i].distance_m, map_data[i].curvature,
+                          map_data[i].line_pos, map_data[i].speed_mps,
+                          (i == map_count - 1) ? "" : ",");
+            uart_write_bytes(UART_NUM_0, buf, len);
+        }
+        uart_write_bytes(UART_NUM_0, "]}\n", 3);
+        return snprintf(out, out_max, "{\"ok\":\"map\",\"n\":%d}\n", map_count);
+    }
+    if (strcmp(cmd, "lap") == 0) {
+        return snprintf(out, out_max, "{\"lap\":%d,\"dist\":%.2f,\"samples\":%d,\"speed\":%.2f,\"state\":%d}\n",
+                        lap_count, total_distance, map_count, cur_ts, (int)sys_state);
+    }
+    if (strcmp(cmd, "reset") == 0) {
+        mapper_reset();
+        return snprintf(out, out_max, "{\"ok\":\"mapper reset\"}\n");
+    }
+    if (strcmp(cmd, "ping") == 0) {
+        g_watchdog_last_ms = xTaskGetTickCount();
+        return snprintf(out, out_max, "{\"ok\":\"pong\"}\n");
+    }
+
+    // ── 状态机命令 ──
+    if (strcmp(cmd, "arm") == 0) {
+        if (sys_state == STATE_RUNNING)
+            return snprintf(out, out_max, "{\"err\":\"already running\"}\n");
+        sys_state = STATE_ARMED;
+        ESP_LOGI(TAG, "ARMED");
+        return snprintf(out, out_max, "{\"ok\":\"armed\"}\n");
+    }
+    if (strcmp(cmd, "go") == 0) {
+        if (sys_state == STATE_IDLE) sys_state = STATE_ARMED;
+        sys_state = STATE_RUNNING;
+        pid_init(&speed_pid, SPEED_PID_KP, SPEED_PID_KI, SPEED_PID_KD, 100.0f);
+        pid_init(&line_pid,  LINE_PID_KP,  LINE_PID_KI,  LINE_PID_KD,  50.0f);
+        ringbuf_init();
+        motor_ramp_active = false;
+        g_watchdog_last_ms = xTaskGetTickCount();
+        ESP_LOGI(TAG, ">>> RUNNING (go)");
+        return snprintf(out, out_max, "{\"ok\":\"running\"}\n");
+    }
+    if (strcmp(cmd, "stop") == 0) {
+        sys_state = STATE_IDLE;
+        motor_ramp_active = true;
+        motor_ramp_step   = 0;
+        motor_ramp_thr[0] = (int32_t)(cur_lt * 100);
+        motor_ramp_thr[1] = (int32_t)(cur_rt * 100);
+        ESP_LOGI(TAG, "STOP (ramp)");
+        return snprintf(out, out_max, "{\"ok\":\"stopped\"}\n");
+    }
+    if (strcmp(cmd, "estop") == 0) {
+        sys_state = STATE_IDLE;
+        motor_coast();
+        ESP_LOGW(TAG, "ESTOP");
+        return snprintf(out, out_max, "{\"ok\":\"estop\"}\n");
+    }
+
+    // ── Profile 上传 ──
+    if (strncmp(cmd, "pload:", 6) == 0) {
+        if (sys_state == STATE_RUNNING)
+            return snprintf(out, out_max, "{\"err\":\"stop first\"}\n");
+        int n = 0;
+        char *p = cmd + 6;
+        while (*p != ':' && *p != '\0') { n = n * 10 + (*p - '0'); p++; }
+        if (*p == ':') p++;
+        if (n > 2048) n = 2048;
+        for (int i = 0; i < n; i++) {
+            uint8_t bytes[4];
+            for (int j = 0; j < 4; j++) {
+                char c1 = p[i * 8 + j * 2];
+                char c2 = p[i * 8 + j * 2 + 1];
+                bytes[j] = (hex_to_val(c1) << 4) | hex_to_val(c2);
+            }
+            memcpy(&profile[i], bytes, 4);
+        }
+        profile_len = n;
+        ESP_LOGI(TAG, "Profile loaded: %d floats", n);
+        return snprintf(out, out_max, "{\"ok\":\"loaded\",\"n\":%d}\n", n);
+    }
+
+    return snprintf(out, out_max, "{\"err\":\"unknown: %s\"}\n", cmd);
+}
+
+void uart_task(void *arg) {
+    int idx = 0;
+    while (1) {
+        int len = uart_read_bytes(UART_NUM_0, (uint8_t*)(uart_rxbuf + idx), 1, pdMS_TO_TICKS(10));
+        if (len > 0) {
+            if (uart_rxbuf[idx] == '\n' || uart_rxbuf[idx] == '\r') {
+                uart_rxbuf[idx] = '\0';
+                if (idx > 0) {
+                    char out[512];
+                    int rlen = process_command(uart_rxbuf, out, sizeof(out));
+                    if (rlen > 0) uart_write_bytes(UART_NUM_0, out, rlen);
+                }
+                idx = 0;
+            } else {
+                idx++;
+                if (idx >= UART_RXBUF_SIZE) idx = 0;
+            }
+        } else if (len < 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+// ================== WiFi 命令接收任务 (Core 0) ==================
+static void __attribute__((unused)) wifi_cmd_task(void *arg) {
+    // Wait for WiFi/lwIP init to complete (done in app_main)
+    while (!wifi_ready) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "wifi_cmd: socket failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(COMMAND_UDP_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "wifi_cmd: bind :%d failed", COMMAND_UDP_PORT);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "wifi_cmd: listening on UDP :%d", COMMAND_UDP_PORT);
+
+    while (1) {
+        char buf[256];
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        int n = recvfrom(sock, buf, sizeof(buf) - 1, 0,
+                         (struct sockaddr *)&from, &from_len);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+
+        // strip trailing \r\n
+        while (n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) buf[--n] = '\0';
+
+        if (n == 0) continue;
+        ESP_LOGI(TAG, "wifi_cmd: '%s'", buf);
+
+        char out[512];
+        int rlen = process_command(buf, out, sizeof(out));
+        if (rlen > 0) {
+            sendto(sock, out, rlen, 0, (struct sockaddr *)&from, from_len);
+        }
+    }
+}
+
+// ================== 1kHz 控制任务 (Core 1) ==================
+static void __attribute__((unused)) control_task(void *arg) {
+    // Delay to let Core 0 finish OLED + WiFi init before we touch flash/hw
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "Control on Core 1 @ %d Hz", CONTROL_LOOP_HZ);
+    motor_init();
+    encoder_init();
+    grayscale_init();
+    imu_init();
+    // imu_calibrate 已移到 planner_task，避免在 1kHz 控制循环中阻塞
+    pid_init(&speed_pid, SPEED_PID_KP, SPEED_PID_KI, SPEED_PID_KD, 100.0f);
+    pid_init(&line_pid,  LINE_PID_KP,  LINE_PID_KI,  LINE_PID_KD,  50.0f);
+    vbat_calibrate();
+    TickType_t lw = xTaskGetTickCount();
+
+    while (1) {
+        // 临时空循环，验证 control_task 本身是否会导致 WDT
+        vTaskDelayUntil(&lw, pdMS_TO_TICKS(1));
+    }
+}
+
+// ================== Core 0 规划 & 遥测 ==================
+static void planner_task(void *arg) {
+    ESP_LOGI(TAG, "Planner on Core 0 @ %d Hz", MAP_SAMPLE_RATE_HZ);
+
+    // Yield for tcpip task to create its mbox
+    vTaskDelay(pdMS_TO_TICKS(50));
+#ifndef BARE_OLED_TEST
+    ringbuf_init();
+#endif
+    oled_init();
+    oled_start_carousel_task();
+#ifndef BARE_OLED_TEST
+    imu_calibrate();  // 在 Core 0 规划任务中校准，不阻塞 1kHz 控制循环
+#endif
+
+#ifndef BARE_OLED_TEST
+    int tick = 0;
+#endif
+    while (1) {
+#ifndef BARE_OLED_TEST
+        float avg_spd = (cur_ls + cur_rs) * 0.5f;
+        mapper_sample(avg_spd, cur_lp, cur_gz);
+
+        if (sys_state == STATE_RUNNING) {
+            control_cmd_t cmd = mapper_predict(total_distance, avg_spd);
+            ringbuf_push(cmd);
+        }
+
+        tick++;
+        if (tick % 5 == 0) {   // 20Hz telemetry (100Hz loop / 5)
+            wifi_send_telemetry(cur_lp, cur_ls, cur_rs, cur_ts, cur_gz, cur_lt, cur_rt);
+        }
+#endif
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ================== Main ==================
+void app_main(void) {
+    // 1. 彻底注释网络协议栈 — 隔离 lwIP WDT 根因
+    ESP_ERROR_CHECK(nvs_flash_init());
+    // ESP_ERROR_CHECK(esp_netif_init());
+    // ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_LOGI(TAG, "[Qizhi-Cup] ESP32-S3 v0.12 — UDP cmd + WiFi telemetry");
+
+    // 2. 外设初始化
+    uart_config_t uart_config = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_set_pin(UART_NUM_0, UART_TX_GPIO, UART_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    i2c_master_init();
+#ifndef BARE_OLED_TEST
+    ledc_init();
+    // 临时注释掉启动按钮，排查 GPIO 9 中断风暴
+    // start_button_init();
+
+    // 3. WiFi — 临时关闭，先验证 DIO flash 基础稳定性
+    // vTaskDelay(pdMS_TO_TICKS(500));
+    // ESP_ERROR_CHECK(wifi_init());
+#endif
+
+    xTaskCreatePinnedToCore(planner_task,  "plan",    8192, NULL, tskIDLE_PRIORITY + 3, NULL, 0);
+    // 临时关闭 WiFi/Control 任务，先验证基础稳定性
+    // xTaskCreatePinnedToCore(wifi_cmd_task, "wificmd", 4096, NULL, tskIDLE_PRIORITY + 2, NULL, 0);
+    xTaskCreatePinnedToCore(control_task,  "ctrl",    8192, NULL, tskIDLE_PRIORITY + 4, NULL, 1);
+    xTaskCreatePinnedToCore(uart_task,     "uart",    4096, NULL, tskIDLE_PRIORITY + 2, NULL, 0);
+}

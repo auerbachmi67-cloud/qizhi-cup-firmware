@@ -2,7 +2,7 @@
 #include "pid.h"
 #include "config.h"
 
-static pid_t speed_pid;
+static pid_ctrl_t speed_pid;
 static bool hold = false;
 
 void speed_control_init(void) {

@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "config.h"
 #include <stdlib.h>
 
 static const char *TAG = "OLED";
@@ -29,10 +30,16 @@ static void oled_i2c_send(uint8_t *data, uint16_t len)
     for (uint16_t i = 0; i < len; i++)
         i2c_master_write_byte(cmd, data[i], true);
     i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(50));
-    i2c_cmd_link_delete(cmd);
-    if (ret != ESP_OK)
-        ESP_LOGE(TAG, "I2C TX fail: %s", esp_err_to_name(ret));
+
+    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
+        esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(10));
+        xSemaphoreGive(i2c_mutex);
+        i2c_cmd_link_delete(cmd);
+        if (ret != ESP_OK)
+            ESP_LOGE(TAG, "I2C TX fail: %s", esp_err_to_name(ret));
+    } else {
+        i2c_cmd_link_delete(cmd);
+    }
 }
 
 /* ====================== 器件参数 ====================== */
@@ -117,20 +124,34 @@ void OLED_SetColorMode(OLED_ColorMode mode)
 
 void OLED_NewFrame()
 {
-    memset(OLED_GRAM, 0, sizeof(OLED_GRAM));
+    // 只清空图片区域（前 6 页：0~47 行，128×6=768 字节）
+    // 底部文字区域（第 6~7 页：48~63 行）不碰，静态文字不动
+    memset(OLED_GRAM, 0, 128 * 6);
 }
 
 void OLED_ShowFrame()
 {
+    // 跑起来时不刷新，冻结屏幕，I2C 全归 IMU
+    if (is_system_running()) {
+        return;
+    }
+
     uint8_t buf[OLED_COLUMN + 1];
     buf[0] = 0x40;
+
     for (uint8_t i = 0; i < OLED_PAGE; i++)
     {
-        OLED_SendCmd(0xB0 + i); // 设置页地址
-        OLED_SendCmd(0x00);     // 列地址低4位
-        OLED_SendCmd(0x10);     // 列地址高4位
+        // 每页独立拿锁+释放，中间 taskYIELD 让出 CPU
+        // ⚠️ 注意回调路径：OLED_SendCmd() → OLED_Send() → s_send_func = oled_i2c_send
+        // oled_i2c_send 内部自己拿锁，所以这里不重复拿锁
+
+        OLED_SendCmd(0xB0 + i);
+        OLED_SendCmd(0x00);
+        OLED_SendCmd(0x10);
         memcpy(buf + 1, OLED_GRAM[i], OLED_COLUMN);
         OLED_Send(buf, OLED_COLUMN + 1);
+
+        taskYIELD();
     }
 }
 
@@ -445,7 +466,11 @@ void oled_init(void)
         i2c_master_start(cmd);
         i2c_master_write_byte(cmd, (test_addrs[i] << 1) | I2C_MASTER_WRITE, true);
         i2c_master_stop(cmd);
-        esp_err_t ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(20));
+        esp_err_t ret = ESP_FAIL;
+        if (xSemaphoreTake(i2c_mutex, portMAX_DELAY)) {
+            ret = i2c_master_cmd_begin(OLED_I2C_PORT, cmd, pdMS_TO_TICKS(20));
+            xSemaphoreGive(i2c_mutex);
+        }
         i2c_cmd_link_delete(cmd);
         if (ret == ESP_OK) {
             s_oled_addr_7bit = test_addrs[i];
@@ -485,18 +510,24 @@ static void oled_carousel_task(void *arg)
 
     ESP_LOGI(TAG, "Carousel task started, %d images", img_count);
 
+    // 底部文字只画一次，不参与轮播
+    OLED_PrintString(25, 45, "动次嗒次队", &font15x20, OLED_COLOR_NORMAL);
+
     while (1) {
-        OLED_NewFrame();
-        OLED_PrintString(25, 45, "动次嗒次队", &font15x20, OLED_COLOR_NORMAL);
+        // 跑起来时不刷新
+        if (!is_system_running()) {
+            OLED_NewFrame();  // 只清图片区，保护底部文字
 
-        const Image *img = images[img_id];
-        uint8_t x = (img_id == 1) ? 39 : 37;   // 与原 example 一致
-        OLED_DrawImage(x, 0, img, OLED_COLOR_NORMAL);
+            const Image *img = images[img_id];
+            uint8_t x = (img_id == 1) ? 39 : 37;
+            OLED_DrawImage(x, 0, img, OLED_COLOR_NORMAL);
 
-        OLED_ShowFrame();
+            OLED_ShowFrame();
+
+            img_id = (img_id + 1) % img_count;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(300));
-        img_id = (img_id + 1) % img_count;
     }
 }
 

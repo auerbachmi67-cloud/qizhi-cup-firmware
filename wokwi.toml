@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+elf = "build/qizhi-cup-firmware.elf"
+firmware = "build/qizhi-cup-firmware.bin"

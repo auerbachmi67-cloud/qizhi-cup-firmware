@@ -14,7 +14,7 @@ typedef struct {
 } map_sample_t;
 
 void mapper_init(void);
-void mapper_sample(void);
+void mapper_sample(float avg_spd, float line_pos, float gyro_z);
 void mapper_predict(void);
 control_cmd_t mapper_get_command(void);
 
