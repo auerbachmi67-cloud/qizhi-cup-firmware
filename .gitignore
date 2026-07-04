@@ -1,0 +1,5 @@
+build/
+sdkconfig
+*.bin
+mock_*.json
+dump.bin

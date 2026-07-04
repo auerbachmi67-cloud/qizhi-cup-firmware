@@ -6,9 +6,9 @@
 
 static const char *TAG = "MOTOR";
 
-static const int IN1[2] = {35, 37};
-static const int IN2[2] = {36, 38};
-static const int PWM[2] = {33, 34};
+static const int IN1[2] = {40, 13};
+static const int IN2[2] = {14, 38};
+static const int PWM[2] = {42, 41};
 static const int STBY = 39;
 
 static float prev_throttle[2] = {0, 0};
@@ -52,7 +52,6 @@ void motor_set_speed(int channel, float throttle) {
     if (throttle < -1.0f) throttle = -1.0f;
     float abs_thr = fabsf(throttle);
 
-    // Smooth stop: crossing to near-zero from driving → ramp PWM down over 50ms
     bool was_running = (fabsf(prev_throttle[channel]) > 0.02f);
     bool stopping = (abs_thr < 0.015f);
 
@@ -72,7 +71,6 @@ void motor_set_speed(int channel, float throttle) {
         return;
     }
 
-    // Normal operation
     if (throttle > 0.015f) {
         gpio_set_level(IN1[channel], 1);
         gpio_set_level(IN2[channel], 0);
@@ -102,5 +100,12 @@ void motor_brake(int channel) {
 }
 
 void motor_coast(void) {
-    gpio_set_level(STBY, 0);
+    gpio_set_level(IN1[0], 0); gpio_set_level(IN2[0], 0);
+    gpio_set_level(IN1[1], 0); gpio_set_level(IN2[1], 0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    prev_throttle[0] = 0; prev_throttle[1] = 0;
+    brake_countdown[0] = 0; brake_countdown[1] = 0;
 }
