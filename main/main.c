@@ -24,6 +24,7 @@
 #include "line_control.h"
 #include "wifi.h"
 #include "oled.h"
+#include "vbat.h"
 
 static const char *TAG = "MAIN";
 
@@ -44,6 +45,10 @@ static volatile float cur_lp = 0, cur_ls = 0, cur_rs = 0, cur_ts = 0, cur_gz = 0
 
 static char uart_rxbuf[20480];
 extern bool wifi_ready;
+
+// Sensor health flags
+static bool g_imu_ok = false;
+static bool g_enc_ok = false;
 
 // ── I2C ────────────────────────────────────────────────────────────────────
 
@@ -141,7 +146,6 @@ static int process_command(char *cmd, char *out, int out_max) {
         g_watchdog_last_ms = xTaskGetTickCount();
         return snprintf(out, out_max, "{\"ok\":\"pong\"}\n");
     }
-
     if (strcmp(cmd, "arm") == 0) {
         if (sys_state == STATE_RUNNING) return snprintf(out, out_max, "{\"err\":\"already running\"}\n");
         sys_state = STATE_ARMED;
@@ -158,6 +162,11 @@ static int process_command(char *cmd, char *out, int out_max) {
         return snprintf(out, out_max, "{\"ok\":\"running\"}\n");
     }
     if (strcmp(cmd, "stop") == 0) {
+        if (sys_state == STATE_RUNNING) {
+            motor_stop_ramp(cur_lt, cur_rt);
+        } else {
+            motor_coast();
+        }
         sys_state = STATE_IDLE;
         ESP_LOGI(TAG, "STOP");
         return snprintf(out, out_max, "{\"ok\":\"stopped\"}\n");
@@ -241,7 +250,6 @@ static void wifi_cmd_task(void *arg) {
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
         int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &from_len);
-        // 防止 recvfrom 出错时空转死循环触发 WDT
         if (n < 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
@@ -269,6 +277,9 @@ static void control_task(void *arg) {
     speed_control_init();
     line_control_init();
 
+    ESP_LOGI(TAG, "Sensor status: IMU=%d ENC=%d GRAY=%d",
+             (int)g_imu_ok, (int)g_enc_ok, (int)grayscale_is_ok());
+
     TickType_t lw = xTaskGetTickCount();
 
     while(1) {
@@ -281,6 +292,19 @@ static void control_task(void *arg) {
         float gz = imu_get_gyro_z();
 
         cur_ls = ls; cur_rs = rs; cur_lp = lp; cur_gz = gz;
+
+        // Core 1 independent watchdog — motor stop if planner (Core 0) is dead
+        uint32_t now_tick = xTaskGetTickCount();
+        if (sys_state == STATE_RUNNING &&
+            (now_tick - g_watchdog_last_ms) > pdMS_TO_TICKS(WATCHDOG_TIMEOUT_MS)) {
+            ESP_LOGW(TAG, "ESTOP (watchdog: %lu ms stale)",
+                     (now_tick - g_watchdog_last_ms) * portTICK_PERIOD_MS);
+            sys_state = STATE_IDLE;
+            motor_coast();
+        }
+
+        // Stop ramp tick (if active)
+        motor_ramp_tick();
 
         if (sys_state == STATE_RUNNING) {
             control_cmd_t cmd = ringbuf_pop();
@@ -299,7 +323,9 @@ static void control_task(void *arg) {
             motor_set_speed(0, lt);
             motor_set_speed(1, rt);
         } else {
-            motor_coast();
+            if (!motor_ramp_active()) {
+                motor_coast();
+            }
             cur_lt = 0; cur_rt = 0; cur_ts = 0; cur_ff = 0;
             speed_reset();
         }
@@ -317,12 +343,6 @@ static void planner_task(void *arg) {
 
     while (1) {
         handle_button_press();
-
-        uint32_t now = xTaskGetTickCount();
-        if (sys_state == STATE_RUNNING && (now - g_watchdog_last_ms) > pdMS_TO_TICKS(WATCHDOG_TIMEOUT_MS)) {
-            ESP_LOGW(TAG, "Watchdog timeout! Stopping.");
-            sys_state = STATE_IDLE;
-        }
 
         if (sys_state == STATE_RUNNING) {
             float avg_spd = (cur_ls + cur_rs) * 0.5f;
@@ -346,7 +366,7 @@ static void planner_task(void *arg) {
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
 
-    ESP_LOGI(TAG, "[Qizhi-Cup] ESP32-S3 v0.13 — I2C Mutex + OLED Freeze + WiFi PowerFix");
+    ESP_LOGI(TAG, "[Qizhi-Cup] ESP32-S3 v0.17 — UART Grayscale + VBAT Comp + C1 Watchdog");
 
     uart_config_t uart_config = {
         .baud_rate  = 115200,
@@ -360,21 +380,18 @@ void app_main(void) {
     uart_param_config(UART_NUM_0, &uart_config);
     uart_set_pin(UART_NUM_0, 43, 44, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    // 打印 MAC 地址，用于确认唯一 ID
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     ESP_LOGI(TAG, "WiFi MAC: %02x:%02x:%02x:%02x:%02x:%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    // 创建 I2C 互斥锁（所有 I2C 外设共享）
     i2c_mutex = xSemaphoreCreateMutex();
 
-    // 严格顺序初始化 I2C 及外设（任务启动前完成，避免并发）
     i2c_master_init();
     oled_init();
     imu_init();
-    imu_calibrate();              // 阻塞 ~200ms，在任务之前完成没问题
-    oled_start_carousel_task();   // 轮播任务使用 i2c_mutex 保护
+    imu_calibrate();
+    oled_start_carousel_task();
 
     start_button_init();
     wifi_init();
